@@ -6,8 +6,7 @@ import pytz
 import aiohttp
 from telegram import Bot
 from telegram.constants import ParseMode
-import pandas as pd
-import numpy as np
+import math
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -99,7 +98,8 @@ async def get_prev_close(session, ticker):
 
 async def get_historical_prices(session, ticker, days=60):
     try:
-        from_date = (datetime.now() - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+        from datetime import timedelta
+        from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         to_date = datetime.now().strftime("%Y-%m-%d")
         url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{from_date}/{to_date}?adjusted=true&sort=asc&apiKey={POLYGON_API_KEY}"
         async with session.get(url, timeout=10) as r:
@@ -114,75 +114,86 @@ async def get_historical_prices(session, ticker, days=60):
 def calc_rsi(prices, period=14):
     if len(prices) < period + 1:
         return None
-    deltas = np.diff(prices)
-    gains = np.where(deltas > 0, deltas, 0)
-    losses = np.where(deltas < 0, -deltas, 0)
-    avg_gain = np.mean(gains[:period])
-    avg_loss = np.mean(losses[:period])
+    deltas = [prices[i+1] - prices[i] for i in range(len(prices)-1)]
+    gains = [d if d > 0 else 0 for d in deltas]
+    losses = [-d if d < 0 else 0 for d in deltas]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
     if avg_loss == 0:
-        return 100
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
+        return 100.0
     for i in range(period, len(deltas)):
-        gain = gains[i]
-        loss = losses[i]
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-        if avg_loss == 0:
-            rsi = 100
-        else:
-            rs = avg_gain / avg_loss
-            rsi = 100 - (100 / (1 + rs))
-    return round(rsi, 1)
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 1)
 
 def calc_sma(prices, period):
     if len(prices) < period:
         return None
-    return round(np.mean(prices[-period:]), 2)
+    return round(sum(prices[-period:]) / period, 2)
 
 def calc_ema(prices, period):
     if len(prices) < period:
         return None
-    prices_series = pd.Series(prices)
-    ema = prices_series.ewm(span=period, adjust=False).mean()
-    return round(float(ema.iloc[-1]), 2)
+    k = 2 / (period + 1)
+    ema = sum(prices[:period]) / period
+    for price in prices[period:]:
+        ema = price * k + ema * (1 - k)
+    return round(ema, 4)
 
 def calc_macd(prices):
     if len(prices) < MA_SLOW + MA_SIGNAL:
         return None, None, None
-    prices_series = pd.Series(prices)
-    ema_fast = prices_series.ewm(span=MA_FAST, adjust=False).mean()
-    ema_slow = prices_series.ewm(span=MA_SLOW, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=MA_SIGNAL, adjust=False).mean()
-    histogram = macd_line - signal_line
-    return round(float(macd_line.iloc[-1]), 4), round(float(signal_line.iloc[-1]), 4), round(float(histogram.iloc[-1]), 4)
+    ema_fast_vals = []
+    ema_slow_vals = []
+    k_fast = 2 / (MA_FAST + 1)
+    k_slow = 2 / (MA_SLOW + 1)
+    ema_f = sum(prices[:MA_FAST]) / MA_FAST
+    ema_s = sum(prices[:MA_SLOW]) / MA_SLOW
+    for i, price in enumerate(prices):
+        if i >= MA_FAST:
+            ema_f = price * k_fast + ema_f * (1 - k_fast)
+            ema_fast_vals.append(ema_f)
+        if i >= MA_SLOW:
+            ema_s = price * k_slow + ema_s * (1 - k_slow)
+            ema_slow_vals.append(ema_s)
+    min_len = min(len(ema_fast_vals), len(ema_slow_vals))
+    macd_line = [ema_fast_vals[-(min_len-i)] - ema_slow_vals[-(min_len-i)] for i in range(min_len)]
+    if len(macd_line) < MA_SIGNAL:
+        return None, None, None
+    k_sig = 2 / (MA_SIGNAL + 1)
+    sig = sum(macd_line[:MA_SIGNAL]) / MA_SIGNAL
+    for val in macd_line[MA_SIGNAL:]:
+        sig = val * k_sig + sig * (1 - k_sig)
+    macd_val = macd_line[-1]
+    hist = macd_val - sig
+    return round(macd_val, 4), round(sig, 4), round(hist, 4)
 
 def interpret_ma_signals(prices, current_price):
     signals = []
     sma20 = calc_sma(prices, MA_SHORT)
     sma50 = calc_sma(prices, MA_LONG)
-    ema12 = calc_ema(prices, MA_FAST)
-    ema26 = calc_ema(prices, MA_SLOW)
     macd, macd_sig, macd_hist = calc_macd(prices)
 
     if sma20 and sma50:
         if sma20 > sma50 and current_price > sma20:
-            signals.append("📈 Golden cross — SMA20 above SMA50, price above both. *Bullish trend.*")
+            signals.append("📈 Golden cross — SMA20 above SMA50. *Bullish trend.*")
         elif sma20 < sma50 and current_price < sma20:
-            signals.append("📉 Death cross — SMA20 below SMA50, price below both. *Bearish trend.*")
+            signals.append("📉 Death cross — SMA20 below SMA50. *Bearish trend.*")
         elif current_price < sma20:
             signals.append(f"⚠️ Price below 20-day SMA (${sma20}). Short-term weakness.")
         elif current_price > sma50:
-            signals.append(f"✅ Price above 50-day SMA (${sma50}). Long-term uptrend intact.")
+            signals.append(f"✅ Price above 50-day SMA (${sma50}). Uptrend intact.")
 
     if macd is not None and macd_sig is not None:
-        if macd > macd_sig and macd_hist > 0:
-            signals.append("📈 MACD bullish crossover — momentum building upward.")
-        elif macd < macd_sig and macd_hist < 0:
-            signals.append("📉 MACD bearish crossover — momentum shifting downward.")
+        if macd > macd_sig and macd_hist and macd_hist > 0:
+            signals.append("📈 MACD bullish — momentum building.")
+        elif macd < macd_sig and macd_hist and macd_hist < 0:
+            signals.append("📉 MACD bearish — momentum shifting down.")
         else:
-            signals.append("➡️ MACD neutral — no clear directional signal.")
+            signals.append("➡️ MACD neutral.")
 
     return signals, sma20, sma50, macd, macd_sig
 
