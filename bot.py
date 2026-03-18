@@ -21,29 +21,25 @@ EST = pytz.timezone("America/New_York")
 
 # ─── YOUR PORTFOLIO ────────────────────────────────────────────────────────────
 HOLDINGS = {
-    "RKLB": {"shares": 700,  "avg_cost": 6.73,   "name": "Rocket Lab USA"},
-    "VTI":  {"shares": 112.17,"avg_cost": 233.36, "name": "Vanguard Total Market"},
-    "ETH":  {"shares": 13.01, "avg_cost": 2068.41,"name": "Ether"},
-    "GD":   {"shares": 64.19, "avg_cost": 252.17, "name": "General Dynamics"},
-    "AMZN": {"shares": 78,    "avg_cost": 144.46, "name": "Amazon"},
-    "GWRE": {"shares": 67,    "avg_cost": 160.57, "name": "Guidewire Software"},
-    "MMC":  {"shares": 61.3,  "avg_cost": 178.30, "name": "Marsh & McLennan"},
-    "SOFI": {"shares": 300,   "avg_cost": 18.39,  "name": "SoFi Technologies"},
-    "BTC":  {"shares": 0.03029,"avg_cost": 86490, "name": "Bitcoin"},
-    "AUR":  {"shares": 450,   "avg_cost": 6.10,   "name": "Aurora Innovation"},
+    "RKLB": {"shares": 700,   "avg_cost": 6.73,   "name": "Rocket Lab USA"},
+    "VTI":  {"shares": 112.17, "avg_cost": 233.36, "name": "Vanguard Total Market"},
+    "ETH":  {"shares": 13.01,  "avg_cost": 2068.41,"name": "Ether"},
+    "GD":   {"shares": 64.19,  "avg_cost": 252.17, "name": "General Dynamics"},
+    "AMZN": {"shares": 78,     "avg_cost": 144.46, "name": "Amazon"},
+    "GWRE": {"shares": 67,     "avg_cost": 160.57, "name": "Guidewire Software"},
+    "MMC":  {"shares": 61.3,   "avg_cost": 178.30, "name": "Marsh & McLennan"},
+    "SOFI": {"shares": 300,    "avg_cost": 18.39,  "name": "SoFi Technologies"},
+    "BTC":  {"shares": 0.03029,"avg_cost": 86490,  "name": "Bitcoin"},
 }
 
 CRYPTO_MAP = {"ETH": "ethereum", "BTC": "bitcoin"}
 
 # ─── PRICE ALERTS ─────────────────────────────────────────────────────────────
 PRICE_ALERTS = [
-    {"ticker": "RKLB", "target": 100.00, "direction": "above", "action": "🔴 TRIM 250 shares at $100 — your planned exit. Net ~$17,900 after 30% tax."},
-    {"ticker": "PANW", "target": 165.00, "direction": "below", "action": "🟢 BUY ZONE — deploy ~$7,000. Analyst avg target $210 (+27%)."},
-    {"ticker": "PANW", "target": 155.00, "direction": "below", "action": "🟢 STRONG BUY — deep in your entry zone. Add full $7,000 position now."},
-    {"ticker": "SOFI", "target": 15.00,  "direction": "below", "action": "🔴 STOP LOSS — exit all 300 shares. Muddy Waters risk too high below $15."},
-    {"ticker": "GWRE", "target": 158.00, "direction": "below", "action": "🟢 ADD OPPORTUNITY — top up GWRE. Analyst avg $266 (+65% from here)."},
-    {"ticker": "WYNN", "target": 97.00,  "direction": "below", "action": "🟡 WATCHLIST ENTRY — WYNN at target zone. $138 analyst avg (+42%)."},
-    {"ticker": "MMC",  "target": 185.00, "direction": "above", "action": "🟡 CONSIDER SELLING MMC — only +2.5% gain, redeploy into PANW/GWRE."},
+    {"ticker": "RKLB", "target": 100.00, "direction": "above", "action": "🔴 TRIM ALERT — RKLB hit $100. Trim 250 shares as planned. Net ~$17,900 after 30% tax. Keep 450 shares running."},
+    {"ticker": "GWRE", "target": 158.00, "direction": "below", "action": "🟢 ADD OPPORTUNITY — GWRE at $158. Top up your position. Analyst avg target $266 (+65% upside)."},
+    {"ticker": "PANW", "target": 160.00, "direction": "below", "action": "🟢 BUY ZONE — PANW hit $160. Start your position. Analyst avg target $210 (+31% upside)."},
+    {"ticker": "WYNN", "target": 90.00,  "direction": "below", "action": "🟢 BUY ZONE — WYNN hit $90. Start a position. Analyst avg target $138 (+53% upside). UAE resort 2027 catalyst."},
 ]
 
 # ─── RSI SETTINGS ─────────────────────────────────────────────────────────────
@@ -58,8 +54,8 @@ MA_FAST = 12    # EMA for MACD
 MA_SLOW = 26    # EMA for MACD
 MA_SIGNAL = 9   # MACD signal line
 
-# ─── NEWS TICKERS ─────────────────────────────────────────────────────────────
-NEWS_TICKERS = ["RKLB", "GWRE", "SOFI", "PANW", "AMZN", "GD", "BTC", "ETH", "WYNN", "EE", "MMC", "AUR", "VTI"]
+# ─── NEWS TICKERS — all owned stocks + watchlist (AUR news only) ──────────────
+NEWS_TICKERS = ["RKLB", "GWRE", "SOFI", "PANW", "AMZN", "GD", "BTC", "ETH", "WYNN", "EE", "MMC", "VTI", "AUR"]
 seen_news = set()
 fired_alerts = {}
 
@@ -280,9 +276,105 @@ async def send_morning_brief():
         lines.append(f"🎯 *$365k Goal:* {goal_pct:.1f}% there")
         lines.append(f"   Gap remaining: ${goal_target - goal_current:,.0f}")
         lines.append("─" * 32)
-        lines.append("⚡ _Alerts active: RKLB $100 trim · PANW $165 buy · SOFI $15 stop_")
+        lines.append("⚡ _Alerts active: RKLB $100 trim · GWRE $158 add · PANW $160 buy · WYNN $90 buy_")
 
         await send_message("\n".join(lines))
+
+        # Send sleeper pick right after morning brief
+        await asyncio.sleep(3)
+        await send_sleeper_pick(session)
+
+# ─── SLEEPER STOCK SCANNER ────────────────────────────────────────────────────
+SLEEPER_WATCHLIST = [
+    {"ticker": "PANW",  "name": "Palo Alto Networks",  "sector": "Cybersecurity"},
+    {"ticker": "WYNN",  "name": "Wynn Resorts",         "sector": "Casino/Hospitality"},
+    {"ticker": "EE",    "name": "Excelerate Energy",    "sector": "LNG Infrastructure"},
+    {"ticker": "CRWD",  "name": "CrowdStrike",          "sector": "Cybersecurity"},
+    {"ticker": "TTD",   "name": "The Trade Desk",       "sector": "AdTech"},
+    {"ticker": "SOFI",  "name": "SoFi Technologies",    "sector": "Fintech"},
+    {"ticker": "ASTS",  "name": "AST SpaceMobile",      "sector": "Space Broadband"},
+    {"ticker": "OKLO",  "name": "Oklo Inc",             "sector": "Micro Nuclear"},
+    {"ticker": "LUNR",  "name": "Intuitive Machines",   "sector": "Space/NASA"},
+    {"ticker": "UBER",  "name": "Uber",                 "sector": "Mobility/AV"},
+    {"ticker": "MELI",  "name": "MercadoLibre",         "sector": "LatAm E-commerce"},
+    {"ticker": "DUOL",  "name": "Duolingo",             "sector": "EdTech"},
+    {"ticker": "NET",   "name": "Cloudflare",           "sector": "Cloud Security"},
+    {"ticker": "PLTR",  "name": "Palantir",             "sector": "AI/Data Analytics"},
+    {"ticker": "COIN",  "name": "Coinbase",             "sector": "Crypto Exchange"},
+    {"ticker": "SQ",    "name": "Block Inc",            "sector": "Fintech"},
+    {"ticker": "SHOP",  "name": "Shopify",              "sector": "E-commerce"},
+    {"ticker": "ZS",    "name": "Zscaler",              "sector": "Cybersecurity"},
+    {"ticker": "DDOG",  "name": "Datadog",              "sector": "Cloud Monitoring"},
+]
+
+async def send_sleeper_pick(session):
+    logger.info("Running sleeper stock scanner...")
+    candidates = []
+
+    for stock in SLEEPER_WATCHLIST:
+        ticker = stock["ticker"]
+        try:
+            from datetime import timedelta
+            from_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+            to_date = datetime.now().strftime("%Y-%m-%d")
+            url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{from_date}/{to_date}?adjusted=true&sort=asc&limit=365&apiKey={POLYGON_API_KEY}"
+            async with session.get(url, timeout=10) as r:
+                data = await r.json()
+                if not data.get("results") or len(data["results"]) < 30:
+                    continue
+                prices = [float(x["c"]) for x in data["results"]]
+                current = prices[-1]
+                high_52w = max(prices)
+                low_52w = min(prices)
+                drawdown = ((high_52w - current) / high_52w) * 100
+                rsi = calc_rsi(prices[-30:], 14)
+                if drawdown >= 30 and rsi and rsi <= 35:
+                    candidates.append({
+                        "ticker": ticker,
+                        "name": stock["name"],
+                        "sector": stock["sector"],
+                        "price": current,
+                        "high_52w": high_52w,
+                        "low_52w": low_52w,
+                        "drawdown": drawdown,
+                        "rsi": rsi,
+                        "score": drawdown + (35 - rsi)
+                    })
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Sleeper scan error {ticker}: {e}")
+            continue
+
+    if not candidates:
+        await send_message(
+            "🔍 *SLEEPER PICK — No strong candidates today*\n"
+            "─────────────────────\n"
+            "No stocks meet both criteria today.\n"
+            "Market may be broadly elevated."
+        )
+        return
+
+    best = sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
+    recovery_potential = ((best["high_52w"] - best["price"]) / best["price"]) * 100
+
+    msg = (
+        f"🔍 *SLEEPER PICK OF THE DAY*\n"
+        f"─────────────────────────\n"
+        f"📌 *{best['name']}* (${best['ticker']})\n"
+        f"🏷 Sector: {best['sector']}\n"
+        f"─────────────────────────\n"
+        f"💲 *Price:* ${best['price']:,.2f}\n"
+        f"📉 *Down from 52w high:* {best['drawdown']:.1f}% (was ${best['high_52w']:,.2f})\n"
+        f"📊 *RSI:* {best['rsi']} — {'🔥 Very oversold' if best['rsi'] < 25 else '⚠️ Oversold'}\n"
+        f"🎯 *Recovery potential:* +{recovery_potential:.1f}%\n"
+        f"─────────────────────────\n"
+        f"{'🟢 Strong setup' if best['drawdown'] >= 40 and best['rsi'] < 30 else '🟡 Worth watching'} — "
+        f"Beaten down {best['drawdown']:.0f}% with oversold RSI.\n"
+        f"Do your own research before acting.\n"
+        f"─────────────────────────\n"
+        f"⚡ _Daily scan · Not financial advice_"
+    )
+    await send_message(msg)
 
 # ─── PRICE ALERT CHECKER ──────────────────────────────────────────────────────
 async def check_price_alerts():
@@ -446,23 +538,48 @@ async def check_ma_alerts():
                     )
                     await send_message(msg)
 
-# ─── NEWS ALERT CHECKER ───────────────────────────────────────────────────────
+# ─── NEWS ALERT CHECKER — Breaking news on big moves only (3%+ day) ──────────
 async def check_news_alerts():
     async with aiohttp.ClientSession() as session:
         for ticker in NEWS_TICKERS:
+            if ticker in CRYPTO_MAP:
+                current = await get_crypto_price(session, CRYPTO_MAP[ticker])
+                prev = None
+            else:
+                current = await get_stock_price(session, ticker)
+                prev = await get_prev_close(session, ticker)
+
+            if not current or not prev:
+                continue
+
+            move_pct = abs((current - prev) / prev) * 100
+
+            # Only fetch news if stock moved 3%+ today
+            if move_pct < 3.0:
+                continue
+
+            direction = "📈" if current > prev else "📉"
+            alert_key = f"news_move_{ticker}_{datetime.now(EST).date()}"
+            if alert_key in fired_alerts:
+                continue
+
             articles = await get_news(session, ticker)
-            for article in articles:
-                if article["title"]:
-                    msg = (
-                        f"📰 *NEWS — {ticker}*\n"
-                        f"─────────────────────\n"
-                        f"{article['title']}\n"
-                        f"─────────────────────\n"
-                        f"📡 Source: {article['source']}\n"
-                        f"🔗 {article['url']}"
-                    )
-                    await send_message(msg)
-                    await asyncio.sleep(2)
+            if not articles:
+                continue
+
+            fired_alerts[alert_key] = datetime.now()
+            top = articles[0]
+            msg = (
+                f"🚨 *BREAKING — {ticker} moved {direction} {move_pct:.1f}% today*\n"
+                f"─────────────────────\n"
+                f"📰 {top['title']}\n"
+                f"─────────────────────\n"
+                f"📡 {top['source']}\n"
+                f"💲 Current: ${current:,.2f} | Prev close: ${prev:,.2f}\n"
+                f"🔗 {top['url']}"
+            )
+            await send_message(msg)
+            await asyncio.sleep(2)
 
 # ─── MARKET HOURS CHECK ───────────────────────────────────────────────────────
 def is_market_open():
