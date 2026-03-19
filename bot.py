@@ -62,11 +62,12 @@ fired_alerts = {}
 # ─── PRICE FETCHING ───────────────────────────────────────────────────────────
 async def get_stock_price(session, ticker):
     try:
-        url = f"https://api.polygon.io/v2/last/trade/{ticker}?apiKey={POLYGON_API_KEY}"
-        async with session.get(url, timeout=10) as r:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with session.get(url, headers=headers, timeout=10) as r:
             data = await r.json()
-            if data.get("results"):
-                return float(data["results"]["p"])
+            result = data["chart"]["result"][0]
+            return float(result["meta"]["regularMarketPrice"])
     except Exception as e:
         logger.error(f"Price fetch error {ticker}: {e}")
     return None
@@ -83,25 +84,28 @@ async def get_crypto_price(session, coin_id):
 
 async def get_prev_close(session, ticker):
     try:
-        url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/prev?adjusted=true&apiKey={POLYGON_API_KEY}"
-        async with session.get(url, timeout=10) as r:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5d"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with session.get(url, headers=headers, timeout=10) as r:
             data = await r.json()
-            if data.get("results"):
-                return float(data["results"][0]["c"])
+            result = data["chart"]["result"][0]
+            closes = result["indicators"]["quote"][0]["close"]
+            closes = [c for c in closes if c is not None]
+            return float(closes[-2]) if len(closes) >= 2 else None
     except Exception as e:
         logger.error(f"Prev close error {ticker}: {e}")
     return None
 
 async def get_historical_prices(session, ticker, days=60):
     try:
-        from datetime import timedelta
-        from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        to_date = datetime.now().strftime("%Y-%m-%d")
-        url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{from_date}/{to_date}?adjusted=true&sort=asc&apiKey={POLYGON_API_KEY}"
-        async with session.get(url, timeout=10) as r:
+        period = "3mo" if days <= 90 else "1y"
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range={period}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with session.get(url, headers=headers, timeout=10) as r:
             data = await r.json()
-            if data.get("results"):
-                return [float(x["c"]) for x in data["results"]]
+            result = data["chart"]["result"][0]
+            closes = result["indicators"]["quote"][0]["close"]
+            return [float(c) for c in closes if c is not None]
     except Exception as e:
         logger.error(f"Historical prices error {ticker}: {e}")
     return None
@@ -250,33 +254,13 @@ async def send_morning_brief():
 
             if price:
                 value = price * info["shares"]
-                cost = info["avg_cost"] * info["shares"]
-                pl = value - cost
-                pl_pct = (pl / cost) * 100
                 total_value += value
-                total_cost += cost
+                lines.append(f"📌 *{ticker}* — ${price:,.2f} | ${value:,.0f}")
 
-                arrow = "▲" if pl > 0 else "▼" if pl < 0 else "─"
-                sign = "+" if pl > 0 else ""
-                lines.append(
-                    f"{arrow} *{ticker}* ${price:,.2f} | "
-                    f"${value:,.0f} | {sign}{pl_pct:.1f}%"
-                )
-
-        total_pl = total_value - total_cost
-        total_pl_pct = (total_pl / total_cost) * 100
         lines.append("─" * 32)
-        lines.append(f"💼 *Invested Value:* ${total_value:,.0f}")
-        lines.append(f"{'📈' if total_pl > 0 else '📉'} *Total P&L:* ${total_pl:+,.0f} ({total_pl_pct:+.1f}%)")
+        lines.append(f"💼 *Total Invested:* ${total_value:,.0f}")
         lines.append("─" * 32)
-
-        goal_current = 291554
-        goal_target = 365000
-        goal_pct = (goal_current / goal_target) * 100
-        lines.append(f"🎯 *$365k Goal:* {goal_pct:.1f}% there")
-        lines.append(f"   Gap remaining: ${goal_target - goal_current:,.0f}")
-        lines.append("─" * 32)
-        lines.append("⚡ _Alerts active: RKLB $100 trim · GWRE $158 add · PANW $160 buy · WYNN $90 buy_")
+        lines.append("⚡ _Alerts: RKLB $100 · GWRE $158 · PANW $160 · WYNN $90_")
 
         await send_message("\n".join(lines))
 
@@ -599,6 +583,96 @@ def is_morning_brief_time():
         now.minute <= 35
     )
 
+# ─── PHASE 1 COMMANDS ────────────────────────────────────────────────────────
+async def handle_commands():
+    from telegram.ext import Application, CommandHandler, ContextTypes
+    from telegram import Update
+
+    async def cmd_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("📊 Pulling your brief...")
+        await send_morning_brief()
+
+    async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("💲 Fetching live prices...")
+        async with aiohttp.ClientSession() as session:
+            lines = ["💲 *LIVE PRICES*", "─" * 24]
+            for ticker, info in HOLDINGS.items():
+                if ticker in CRYPTO_MAP:
+                    price = await get_crypto_price(session, CRYPTO_MAP[ticker])
+                else:
+                    price = await get_stock_price(session, ticker)
+                if price:
+                    lines.append(f"📌 *{ticker}* — ${price:,.2f}")
+            await send_message("\n".join(lines))
+
+    async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("👀 Checking watchlist...")
+        async with aiohttp.ClientSession() as session:
+            watchlist = [
+                ("PANW", "Palo Alto Networks", 160.00),
+                ("WYNN", "Wynn Resorts", 90.00),
+                ("EE",   "Excelerate Energy", 34.00),
+            ]
+            lines = ["👀 *WATCHLIST*", "─" * 24]
+            for ticker, name, target in watchlist:
+                price = await get_stock_price(session, ticker)
+                if price:
+                    diff = price - target
+                    status = "🟢 IN ZONE" if price <= target else f"${diff:+.2f} away"
+                    lines.append(f"📌 *{ticker}* — ${price:,.2f} | Target ${target} | {status}")
+            await send_message("\n".join(lines))
+
+    async def cmd_sleeper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("🔍 Running sleeper scanner...")
+        async with aiohttp.ClientSession() as session:
+            await send_sleeper_pick(session)
+
+    async def cmd_rsi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("📊 Calculating RSI for all holdings...")
+        async with aiohttp.ClientSession() as session:
+            lines = ["📊 *RSI READINGS*", "─" * 24,
+                     "≤30 = Oversold 🟢 | ≥70 = Overbought 🔴 | Mid = Neutral ─"]
+            for ticker in HOLDINGS:
+                if ticker in CRYPTO_MAP:
+                    continue
+                prices = await get_historical_prices(session, ticker, days=60)
+                if prices and len(prices) > 14:
+                    rsi = calc_rsi(prices, 14)
+                    if rsi:
+                        if rsi <= 30:
+                            icon = "🟢"
+                        elif rsi >= 70:
+                            icon = "🔴"
+                        else:
+                            icon = "─"
+                        lines.append(f"{icon} *{ticker}* — RSI {rsi}")
+            await send_message("\n".join(lines))
+
+    async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        msg = (
+            "🤖 *PATRICK BOT COMMANDS*\n"
+            "─────────────────────\n"
+            "/brief — Morning brief on demand\n"
+            "/prices — Live prices for all holdings\n"
+            "/watchlist — PANW · WYNN · EE vs targets\n"
+            "/sleeper — Run sleeper scanner now\n"
+            "/rsi — RSI for all holdings\n"
+            "/help — Show this menu"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("brief", cmd_brief))
+    app.add_handler(CommandHandler("prices", cmd_prices))
+    app.add_handler(CommandHandler("watchlist", cmd_watchlist))
+    app.add_handler(CommandHandler("sleeper", cmd_sleeper))
+    app.add_handler(CommandHandler("rsi", cmd_rsi))
+    app.add_handler(CommandHandler("help", cmd_help))
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    return app
+
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 async def main():
     logger.info("Patrick's Portfolio Bot starting...")
@@ -606,16 +680,19 @@ async def main():
         "🤖 *Patrick's Portfolio Bot is LIVE*\n"
         "─────────────────────\n"
         "✅ Morning briefs: 9:30am EST\n"
-        "✅ Price alerts: Active\n"
-        "✅ RSI signals: Active (oversold ≤30, overbought ≥70)\n"
-        "✅ Moving average alerts: Active\n"
-        "✅ News alerts: Active\n"
+        "✅ Price alerts: Active (Yahoo Finance — real-time)\n"
+        "✅ RSI signals: Active\n"
+        "✅ MA crossover alerts: Active\n"
+        "✅ Breaking news: Active (3%+ moves)\n"
+        "✅ Daily sleeper pick: Active\n"
+        "─────────────────────\n"
+        "💬 Commands: /brief /prices /watchlist /sleeper /rsi /help\n"
         "─────────────────────\n"
         "Tracking: RKLB · VTI · ETH · GD · AMZN\n"
-        "GWRE · MMC · SOFI · BTC · AUR\n"
-        "─────────────────────\n"
-        "🎯 Price targets set. Watching for your entries."
+        "GWRE · MMC · SOFI · BTC"
     )
+
+    app = await handle_commands()
 
     morning_brief_sent_today = None
     last_price_check = None
@@ -623,39 +700,38 @@ async def main():
     last_ma_check = None
     last_news_check = None
 
-    while True:
-        now = datetime.now(EST)
-        today = now.date()
+    try:
+        while True:
+            now = datetime.now(EST)
+            today = now.date()
 
-        # Morning brief at 9:30am EST on weekdays
-        if is_morning_brief_time() and morning_brief_sent_today != today:
-            await send_morning_brief()
-            morning_brief_sent_today = today
+            if is_morning_brief_time() and morning_brief_sent_today != today:
+                await send_morning_brief()
+                morning_brief_sent_today = today
 
-        # Price alerts every 5 minutes during market hours
-        if is_market_open():
-            if not last_price_check or (now - last_price_check).seconds >= 300:
-                await check_price_alerts()
-                last_price_check = now
+            if is_market_open():
+                if not last_price_check or (now - last_price_check).seconds >= 300:
+                    await check_price_alerts()
+                    last_price_check = now
 
-        # RSI check every 30 minutes during market hours
-        if is_market_open():
-            if not last_rsi_check or (now - last_rsi_check).seconds >= 1800:
-                await check_rsi_alerts()
-                last_rsi_check = now
+            if is_market_open():
+                if not last_rsi_check or (now - last_rsi_check).seconds >= 1800:
+                    await check_rsi_alerts()
+                    last_rsi_check = now
 
-        # MA crossover check every 60 minutes during market hours
-        if is_market_open():
-            if not last_ma_check or (now - last_ma_check).seconds >= 3600:
-                await check_ma_alerts()
-                last_ma_check = now
+            if is_market_open():
+                if not last_ma_check or (now - last_ma_check).seconds >= 3600:
+                    await check_ma_alerts()
+                    last_ma_check = now
 
-        # News check every 30 minutes
-        if not last_news_check or (now - last_news_check).seconds >= 1800:
-            await check_news_alerts()
-            last_news_check = now
+            if not last_news_check or (now - last_news_check).seconds >= 1800:
+                await check_news_alerts()
+                last_news_check = now
 
-        await asyncio.sleep(60)
+            await asyncio.sleep(60)
+    finally:
+        await app.updater.stop()
+        await app.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
