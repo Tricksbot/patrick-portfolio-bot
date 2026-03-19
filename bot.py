@@ -74,10 +74,15 @@ async def get_stock_price(session, ticker):
 
 async def get_crypto_price(session, coin_id):
     try:
-        url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
-        async with session.get(url, timeout=10) as r:
+        # Map coin_id to Yahoo Finance ticker
+        ticker_map = {"bitcoin": "BTC-USD", "ethereum": "ETH-USD"}
+        ticker = ticker_map.get(coin_id, f"{coin_id.upper()}-USD")
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with session.get(url, headers=headers, timeout=10) as r:
             data = await r.json()
-            return float(data[coin_id]["usd"])
+            result = data["chart"]["result"][0]
+            return float(result["meta"]["regularMarketPrice"])
     except Exception as e:
         logger.error(f"Crypto fetch error {coin_id}: {e}")
     return None
@@ -583,95 +588,85 @@ def is_morning_brief_time():
         now.minute <= 35
     )
 
-# ─── PHASE 1 COMMANDS ────────────────────────────────────────────────────────
+# ─── PHASE 1 COMMANDS — lightweight getUpdates polling ──────────────────────
+last_update_id = 0
+
 async def handle_commands():
-    from telegram.ext import Application, CommandHandler, ContextTypes
-    from telegram import Update
-
-    async def cmd_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("📊 Pulling your brief...")
-        await send_morning_brief()
-
-    async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("💲 Fetching live prices...")
+    global last_update_id
+    try:
+        bot = Bot(token=TELEGRAM_TOKEN)
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={last_update_id + 1}&timeout=1"
         async with aiohttp.ClientSession() as session:
-            lines = ["💲 *LIVE PRICES*", "─" * 24]
-            for ticker, info in HOLDINGS.items():
-                if ticker in CRYPTO_MAP:
-                    price = await get_crypto_price(session, CRYPTO_MAP[ticker])
-                else:
-                    price = await get_stock_price(session, ticker)
-                if price:
-                    lines.append(f"📌 *{ticker}* — ${price:,.2f}")
-            await send_message("\n".join(lines))
-
-    async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("👀 Checking watchlist...")
-        async with aiohttp.ClientSession() as session:
-            watchlist = [
-                ("PANW", "Palo Alto Networks", 160.00),
-                ("WYNN", "Wynn Resorts", 90.00),
-                ("EE",   "Excelerate Energy", 34.00),
-            ]
-            lines = ["👀 *WATCHLIST*", "─" * 24]
-            for ticker, name, target in watchlist:
-                price = await get_stock_price(session, ticker)
-                if price:
-                    diff = price - target
-                    status = "🟢 IN ZONE" if price <= target else f"${diff:+.2f} away"
-                    lines.append(f"📌 *{ticker}* — ${price:,.2f} | Target ${target} | {status}")
-            await send_message("\n".join(lines))
-
-    async def cmd_sleeper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🔍 Running sleeper scanner...")
-        async with aiohttp.ClientSession() as session:
-            await send_sleeper_pick(session)
-
-    async def cmd_rsi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("📊 Calculating RSI for all holdings...")
-        async with aiohttp.ClientSession() as session:
-            lines = ["📊 *RSI READINGS*", "─" * 24,
-                     "≤30 = Oversold 🟢 | ≥70 = Overbought 🔴 | Mid = Neutral ─"]
-            for ticker in HOLDINGS:
-                if ticker in CRYPTO_MAP:
-                    continue
-                prices = await get_historical_prices(session, ticker, days=60)
-                if prices and len(prices) > 14:
-                    rsi = calc_rsi(prices, 14)
-                    if rsi:
-                        if rsi <= 30:
-                            icon = "🟢"
-                        elif rsi >= 70:
-                            icon = "🔴"
-                        else:
-                            icon = "─"
-                        lines.append(f"{icon} *{ticker}* — RSI {rsi}")
-            await send_message("\n".join(lines))
-
-    async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        msg = (
-            "🤖 *PATRICK BOT COMMANDS*\n"
-            "─────────────────────\n"
-            "/brief — Morning brief on demand\n"
-            "/prices — Live prices for all holdings\n"
-            "/watchlist — PANW · WYNN · EE vs targets\n"
-            "/sleeper — Run sleeper scanner now\n"
-            "/rsi — RSI for all holdings\n"
-            "/help — Show this menu"
-        )
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("brief", cmd_brief))
-    app.add_handler(CommandHandler("prices", cmd_prices))
-    app.add_handler(CommandHandler("watchlist", cmd_watchlist))
-    app.add_handler(CommandHandler("sleeper", cmd_sleeper))
-    app.add_handler(CommandHandler("rsi", cmd_rsi))
-    app.add_handler(CommandHandler("help", cmd_help))
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    return app
+            async with session.get(url, timeout=5) as r:
+                data = await r.json()
+                updates = data.get("result", [])
+                for update in updates:
+                    last_update_id = update["update_id"]
+                    message = update.get("message", {})
+                    text = message.get("text", "").strip().lower()
+                    if not text.startswith("/"):
+                        continue
+                    cmd = text.split()[0]
+                    if cmd == "/brief":
+                        await send_message("📊 Pulling your brief...")
+                        await send_morning_brief()
+                    elif cmd == "/prices":
+                        async with aiohttp.ClientSession() as s:
+                            lines = ["💲 *LIVE PRICES*", "─" * 24]
+                            for ticker, info in HOLDINGS.items():
+                                if ticker in CRYPTO_MAP:
+                                    price = await get_crypto_price(s, CRYPTO_MAP[ticker])
+                                else:
+                                    price = await get_stock_price(s, ticker)
+                                if price:
+                                    lines.append(f"📌 *{ticker}* — ${price:,.2f}")
+                            await send_message("\n".join(lines))
+                    elif cmd == "/watchlist":
+                        async with aiohttp.ClientSession() as s:
+                            watchlist = [
+                                ("PANW", 160.00),
+                                ("WYNN", 90.00),
+                                ("EE",   34.00),
+                            ]
+                            lines = ["👀 *WATCHLIST*", "─" * 24]
+                            for ticker, target in watchlist:
+                                price = await get_stock_price(s, ticker)
+                                if price:
+                                    diff = price - target
+                                    status = "🟢 IN ZONE" if price <= target else f"${diff:+.2f} away"
+                                    lines.append(f"📌 *{ticker}* — ${price:,.2f} | Target ${target} | {status}")
+                            await send_message("\n".join(lines))
+                    elif cmd == "/sleeper":
+                        await send_message("🔍 Running sleeper scanner...")
+                        async with aiohttp.ClientSession() as s:
+                            await send_sleeper_pick(s)
+                    elif cmd == "/rsi":
+                        async with aiohttp.ClientSession() as s:
+                            lines = ["📊 *RSI READINGS*", "─" * 24,
+                                     "🟢 ≤30 Oversold · 🔴 ≥70 Overbought · ─ Neutral"]
+                            for ticker in HOLDINGS:
+                                if ticker in CRYPTO_MAP:
+                                    continue
+                                prices = await get_historical_prices(s, ticker, days=60)
+                                if prices and len(prices) > 14:
+                                    rsi = calc_rsi(prices, 14)
+                                    if rsi:
+                                        icon = "🟢" if rsi <= 30 else "🔴" if rsi >= 70 else "─"
+                                        lines.append(f"{icon} *{ticker}* — RSI {rsi}")
+                            await send_message("\n".join(lines))
+                    elif cmd == "/help":
+                        await send_message(
+                            "🤖 *COMMANDS*\n"
+                            "─────────────────────\n"
+                            "/brief — Morning brief on demand\n"
+                            "/prices — Live prices now\n"
+                            "/watchlist — PANW · WYNN · EE vs targets\n"
+                            "/sleeper — Run sleeper scanner\n"
+                            "/rsi — RSI for all holdings\n"
+                            "/help — This menu"
+                        )
+    except Exception as e:
+        logger.error(f"Command handler error: {e}")
 
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 async def main():
@@ -692,16 +687,13 @@ async def main():
         "GWRE · MMC · SOFI · BTC"
     )
 
-    app = await handle_commands()
-
     morning_brief_sent_today = None
     last_price_check = None
     last_rsi_check = None
     last_ma_check = None
     last_news_check = None
 
-    try:
-        while True:
+    while True:
             now = datetime.now(EST)
             today = now.date()
 
@@ -728,10 +720,9 @@ async def main():
                 await check_news_alerts()
                 last_news_check = now
 
-            await asyncio.sleep(60)
-    finally:
-        await app.updater.stop()
-        await app.stop()
+            # Check for commands every 3 seconds
+            await handle_commands()
+            await asyncio.sleep(3)
 
 if __name__ == "__main__":
     asyncio.run(main())
