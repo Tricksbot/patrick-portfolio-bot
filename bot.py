@@ -16,6 +16,9 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
 NEWS_API_KEY = os.environ.get("NEWS_API_KEY")
+EMAIL_FROM = os.environ.get("EMAIL_FROM")      # your Gmail address
+EMAIL_TO = os.environ.get("EMAIL_TO")          # where to send reports
+EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")  # Gmail app password
 
 EST = pytz.timezone("America/New_York")
 
@@ -237,6 +240,52 @@ async def send_message(text):
     except Exception as e:
         logger.error(f"Telegram send error: {e}")
 
+# ─── EMAIL SENDER ─────────────────────────────────────────────────────────────
+async def send_email(subject, html_body):
+    try:
+        import smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_FROM
+        msg["To"] = EMAIL_TO
+        msg.attach(MIMEText(html_body, "html"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(EMAIL_FROM, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        logger.info(f"Email sent: {subject}")
+    except Exception as e:
+        logger.error(f"Email send error: {e}")
+
+def build_email(title, sections):
+    rows = ""
+    for section in sections:
+        rows += f"""
+        <tr>
+          <td style="padding:16px 24px;border-bottom:1px solid #f0f0f0;">
+            <div style="font-size:11px;font-family:monospace;letter-spacing:0.1em;color:#999;text-transform:uppercase;margin-bottom:8px;">{section['label']}</div>
+            <div style="font-size:14px;color:#1a1a1a;line-height:1.8;">{section['content']}</div>
+          </td>
+        </tr>"""
+    return f"""
+    <html><body style="margin:0;padding:0;background:#f5f5f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+    <table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f5;padding:32px 16px;">
+      <tr><td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+          <tr><td style="background:#0f0f14;padding:24px;text-align:center;">
+            <div style="font-size:22px;font-weight:700;color:#e8c96e;letter-spacing:-0.5px;">Patrick's Portfolio Bot</div>
+            <div style="font-size:12px;color:#666;margin-top:4px;">{title}</div>
+          </td></tr>
+          {rows}
+          <tr><td style="padding:16px 24px;background:#fafafa;text-align:center;">
+            <div style="font-size:11px;color:#bbb;">Not financial advice · Patrick Portfolio Bot · {datetime.now(EST).strftime('%b %d, %Y')}</div>
+          </td></tr>
+        </table>
+      </td></tr>
+    </table>
+    </body></html>"""
+
 # ─── MORNING BRIEF ────────────────────────────────────────────────────────────
 async def send_morning_brief():
     logger.info("Sending morning brief...")
@@ -268,6 +317,25 @@ async def send_morning_brief():
         lines.append("⚡ _Alerts: RKLB $100 · GWRE $158 · PANW $160 · WYNN $90_")
 
         await send_message("\n".join(lines))
+
+        # Also send morning brief as HTML email
+        holdings_html = "".join(
+            f'<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #f5f5f5;">'
+            f'<span style="font-weight:500;">{line.replace("📌 *","").replace("* —","")[:30]}</span>'
+            f'</div>'
+            for line in lines if line.startswith("📌")
+        )
+        email_html = build_email(
+            f"Morning Brief · {datetime.now(EST).strftime('%A, %b %d')}",
+            [
+                {"label": "Portfolio Prices", "content": "<br>".join(
+                    l.replace("*","").replace("📌","") for l in lines if l.startswith("📌")
+                )},
+                {"label": "Total Invested", "content": next((l.replace("💼 *Total Invested:* ","") for l in lines if "Total Invested" in l), "—")},
+                {"label": "Active Alerts", "content": "RKLB trim @ $100 &nbsp;·&nbsp; GWRE add @ $158 &nbsp;·&nbsp; PANW buy @ $160 &nbsp;·&nbsp; WYNN buy @ $90"},
+            ]
+        )
+        await send_email(f"☀️ Morning Brief — {datetime.now(EST).strftime('%a %b %d')}", email_html)
 
         # Send sleeper pick right after morning brief
         await asyncio.sleep(3)
@@ -527,8 +595,10 @@ async def check_ma_alerts():
                     )
                     await send_message(msg)
 
-# ─── NEWS ALERT CHECKER — Breaking news on big moves only (3%+ day) ──────────
-async def check_news_alerts():
+# ─── NEWS COLLECTOR — Silently collects news all day for EOD report ─────────
+daily_news_cache = []
+
+async def collect_news():
     async with aiohttp.ClientSession() as session:
         for ticker in NEWS_TICKERS:
             if ticker in CRYPTO_MAP:
@@ -538,37 +608,144 @@ async def check_news_alerts():
                 current = await get_stock_price(session, ticker)
                 prev = await get_prev_close(session, ticker)
 
-            if not current or not prev:
-                continue
+            try:
+                articles = await get_news(session, ticker)
+                for article in articles:
+                    title = article.get("title", "")
+                    # Filter non-English articles
+                    if not title:
+                        continue
+                    non_english_chars = sum(1 for c in title if ord(c) > 127)
+                    if non_english_chars > len(title) * 0.2:
+                        continue
+                    cache_key = article.get("url", "")
+                    if cache_key in [n.get("url") for n in daily_news_cache]:
+                        continue
+                    move_pct = 0
+                    direction = ""
+                    if current and prev:
+                        move_pct = ((current - prev) / prev) * 100
+                        direction = "📈" if move_pct > 0 else "📉"
+                    daily_news_cache.append({
+                        "ticker": ticker,
+                        "title": title,
+                        "source": article.get("source", ""),
+                        "url": article.get("url", ""),
+                        "move_pct": move_pct,
+                        "direction": direction,
+                        "price": current
+                    })
+            except Exception as e:
+                logger.error(f"News collect error {ticker}: {e}")
+            await asyncio.sleep(0.5)
 
-            move_pct = abs((current - prev) / prev) * 100
+# ─── END OF DAY REPORT — Sent at 4:30pm EST via email ────────────────────────
+async def send_eod_report():
+    logger.info("Sending end of day report...")
+    async with aiohttp.ClientSession() as session:
 
-            # Only fetch news if stock moved 3%+ today
-            if move_pct < 3.0:
-                continue
+        # Build prices section
+        price_rows = ""
+        total_value = 0
+        for ticker, info in HOLDINGS.items():
+            if ticker in CRYPTO_MAP:
+                price = await get_crypto_price(session, CRYPTO_MAP[ticker])
+                prev = None
+            else:
+                price = await get_stock_price(session, ticker)
+                prev = await get_prev_close(session, ticker)
+            if price:
+                value = price * info["shares"]
+                total_value += value
+                if prev:
+                    chg = ((price - prev) / prev) * 100
+                    chg_str = f"+{chg:.1f}%" if chg > 0 else f"{chg:.1f}%"
+                    color = "#1a7a4a" if chg > 0 else "#b83232"
+                else:
+                    chg_str = "—"
+                    color = "#999"
+                price_rows += f"""<tr>
+                    <td style="padding:8px 12px;border-bottom:1px solid #f5f5f5;font-weight:500;">{ticker}</td>
+                    <td style="padding:8px 12px;border-bottom:1px solid #f5f5f5;">{info['name']}</td>
+                    <td style="padding:8px 12px;border-bottom:1px solid #f5f5f5;text-align:right;">${price:,.2f}</td>
+                    <td style="padding:8px 12px;border-bottom:1px solid #f5f5f5;text-align:right;color:{color};font-weight:500;">{chg_str}</td>
+                </tr>"""
 
-            direction = "📈" if current > prev else "📉"
-            alert_key = f"news_move_{ticker}_{datetime.now(EST).date()}"
-            if alert_key in fired_alerts:
-                continue
+        prices_table = f"""<table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;">
+            <tr style="background:#f8f8f8;">
+                <th style="padding:8px 12px;text-align:left;font-size:11px;color:#999;font-weight:500;">Ticker</th>
+                <th style="padding:8px 12px;text-align:left;font-size:11px;color:#999;font-weight:500;">Name</th>
+                <th style="padding:8px 12px;text-align:right;font-size:11px;color:#999;font-weight:500;">Price</th>
+                <th style="padding:8px 12px;text-align:right;font-size:11px;color:#999;font-weight:500;">Day Chg</th>
+            </tr>
+            {price_rows}
+        </table>"""
 
-            articles = await get_news(session, ticker)
-            if not articles:
-                continue
+        # Build news section — English only, grouped by ticker
+        news_html = ""
+        if daily_news_cache:
+            seen = set()
+            for item in daily_news_cache[-20:]:
+                key = item["url"]
+                if key in seen:
+                    continue
+                seen.add(key)
+                move_badge = ""
+                if abs(item["move_pct"]) >= 3:
+                    move_color = "#1a7a4a" if item["move_pct"] > 0 else "#b83232"
+                    move_badge = f'<span style="background:{move_color};color:white;font-size:10px;padding:2px 6px;border-radius:3px;margin-left:6px;">{item["direction"]}{abs(item["move_pct"]):.1f}%</span>'
+                news_html += f"""<div style="padding:10px 0;border-bottom:1px solid #f5f5f5;">
+                    <div style="font-size:12px;font-weight:600;color:#e8a030;margin-bottom:4px;">{item['ticker']}{move_badge}</div>
+                    <div style="font-size:13px;color:#1a1a1a;margin-bottom:4px;">{item['title']}</div>
+                    <div style="font-size:11px;color:#999;">{item['source']} &nbsp;·&nbsp; <a href="{item['url']}" style="color:#5b9cf6;">Read article</a></div>
+                </div>"""
+        else:
+            news_html = "<div style='color:#999;font-size:13px;'>No significant news today.</div>"
 
-            fired_alerts[alert_key] = datetime.now()
-            top = articles[0]
-            msg = (
-                f"🚨 *BREAKING — {ticker} moved {direction} {move_pct:.1f}% today*\n"
-                f"─────────────────────\n"
-                f"📰 {top['title']}\n"
-                f"─────────────────────\n"
-                f"📡 {top['source']}\n"
-                f"💲 Current: ${current:,.2f} | Prev close: ${prev:,.2f}\n"
-                f"🔗 {top['url']}"
-            )
-            await send_message(msg)
-            await asyncio.sleep(2)
+        # Watchlist section
+        watchlist_items = [("PANW", 160.00), ("WYNN", 90.00), ("EE", 34.00)]
+        watch_html = ""
+        for ticker, target in watchlist_items:
+            price = await get_stock_price(session, ticker)
+            if price:
+                diff = price - target
+                status_color = "#1a7a4a" if price <= target else "#666"
+                status = "🟢 IN ENTRY ZONE" if price <= target else f"${abs(diff):.2f} above target"
+                watch_html += f"""<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f5f5f5;font-size:13px;">
+                    <span style="font-weight:500;">{ticker}</span>
+                    <span>${price:,.2f}</span>
+                    <span>Target ${target}</span>
+                    <span style="color:{status_color};">{status}</span>
+                </div>"""
+
+        # Goal tracker
+        goal_pct = min((total_value / 365000) * 100, 100)
+        goal_bar_width = int(goal_pct)
+
+        email_html = build_email(
+            f"End of Day Report · {datetime.now(EST).strftime('%A, %b %d, %Y')}",
+            [
+                {"label": "Portfolio Close", "content": prices_table},
+                {"label": "Watchlist Status", "content": watch_html},
+                {"label": "Today's News (English only)", "content": news_html},
+                {"label": "$365k Goal Progress", "content": f"""
+                    <div style="font-size:22px;font-weight:700;color:#e8a030;">{goal_pct:.1f}%</div>
+                    <div style="background:#f0f0f0;border-radius:4px;height:10px;margin:10px 0;overflow:hidden;">
+                        <div style="background:#e8a030;height:100%;width:{goal_bar_width}%;border-radius:4px;"></div>
+                    </div>
+                    <div style="font-size:13px;color:#666;">Invested value: ${total_value:,.0f} · Gap to $365k: ${max(365000-total_value,0):,.0f}</div>
+                """},
+            ]
+        )
+
+        await send_email(
+            f"📊 EOD Report — {datetime.now(EST).strftime('%a %b %d')}",
+            email_html
+        )
+
+        # Clear news cache for tomorrow
+        daily_news_cache.clear()
+        logger.info("EOD report sent, news cache cleared")
 
 # ─── MARKET HOURS CHECK ───────────────────────────────────────────────────────
 def is_market_open():
@@ -678,7 +855,7 @@ async def main():
         "✅ Price alerts: Active (Yahoo Finance — real-time)\n"
         "✅ RSI signals: Active\n"
         "✅ MA crossover alerts: Active\n"
-        "✅ Breaking news: Active (3%+ moves)\n"
+        "✅ News: Collected silently → EOD email report\n"
         "✅ Daily sleeper pick: Active\n"
         "─────────────────────\n"
         "💬 Commands: /brief /prices /watchlist /sleeper /rsi /help\n"
@@ -688,37 +865,51 @@ async def main():
     )
 
     morning_brief_sent_today = None
+    eod_sent_today = None
     last_price_check = None
     last_rsi_check = None
     last_ma_check = None
-    last_news_check = None
+    last_news_collect = None
 
     while True:
             now = datetime.now(EST)
             today = now.date()
 
+            # Morning brief at 9:30am EST weekdays
             if is_morning_brief_time() and morning_brief_sent_today != today:
                 await send_morning_brief()
                 morning_brief_sent_today = today
 
+            # Price alerts every 5 minutes during market hours
             if is_market_open():
                 if not last_price_check or (now - last_price_check).seconds >= 300:
                     await check_price_alerts()
                     last_price_check = now
 
+            # RSI check every 30 minutes during market hours
             if is_market_open():
                 if not last_rsi_check or (now - last_rsi_check).seconds >= 1800:
                     await check_rsi_alerts()
                     last_rsi_check = now
 
+            # MA crossover check every 60 minutes during market hours
             if is_market_open():
                 if not last_ma_check or (now - last_ma_check).seconds >= 3600:
                     await check_ma_alerts()
                     last_ma_check = now
 
-            if not last_news_check or (now - last_news_check).seconds >= 1800:
-                await check_news_alerts()
-                last_news_check = now
+            # Collect news silently every 30 minutes during market hours
+            if is_market_open():
+                if not last_news_collect or (now - last_news_collect).seconds >= 1800:
+                    await collect_news()
+                    last_news_collect = now
+
+            # EOD report at 4:30pm EST weekdays
+            if (now.weekday() < 5 and now.hour == 16 and
+                    now.minute >= 30 and now.minute <= 35 and
+                    eod_sent_today != today):
+                await send_eod_report()
+                eod_sent_today = today
 
             # Check for commands every 3 seconds
             await handle_commands()
