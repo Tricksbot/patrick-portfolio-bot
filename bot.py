@@ -30,7 +30,7 @@ HOLDINGS = {
     "GD":   {"shares": 64.19,  "avg_cost": 252.17, "name": "General Dynamics"},
     "AMZN": {"shares": 78,     "avg_cost": 144.46, "name": "Amazon"},
     "GWRE": {"shares": 67,     "avg_cost": 160.57, "name": "Guidewire Software"},
-    "MMC":  {"shares": 61.3,   "avg_cost": 178.30, "name": "Marsh & McLennan"},
+    "MRSH": {"shares": 61.3,   "avg_cost": 178.30, "name": "Marsh McLennan"},
     "SOFI": {"shares": 300,    "avg_cost": 18.39,  "name": "SoFi Technologies"},
     "BTC":  {"shares": 0.03029,"avg_cost": 86490,  "name": "Bitcoin"},
 }
@@ -58,7 +58,7 @@ MA_SLOW = 26    # EMA for MACD
 MA_SIGNAL = 9   # MACD signal line
 
 # ─── NEWS TICKERS — all owned stocks + watchlist (AUR news only) ──────────────
-NEWS_TICKERS = ["RKLB", "GWRE", "SOFI", "PANW", "AMZN", "GD", "BTC", "ETH", "WYNN", "EE", "MMC", "VTI", "AUR"]
+NEWS_TICKERS = ["RKLB", "GWRE", "SOFI", "PANW", "AMZN", "GD", "BTC", "ETH", "WYNN", "EE", "MRSH", "VTI", "AUR"]
 seen_news = set()
 fired_alerts = {}
 
@@ -743,6 +743,21 @@ async def send_eod_report():
             email_html
         )
 
+        # Economy articles
+        eco_articles = await get_economy_articles()
+        eco_html = ""
+        if eco_articles:
+            for art in eco_articles:
+                eco_html += (
+                    '<div style="padding:10px 0;border-bottom:1px solid #f5f5f5;">'
+                    '<div style="font-size:13px;color:#1a1a1a;font-weight:500;margin-bottom:4px;">' + art["title"] + '</div>'
+                    '<div style="font-size:12px;color:#999;margin-bottom:3px;">' + art["description"] + '</div>'
+                    '<div style="font-size:11px;color:#999;">' + art["source"] + ' &nbsp;·&nbsp; <a href="' + art["url"] + '" style="color:#5b9cf6;">Read article</a></div>'
+                    '</div>'
+                )
+        else:
+            eco_html = '<div style="color:#999;font-size:13px;">No economy articles today.</div>'
+
         # Clear news cache for tomorrow
         daily_news_cache.clear()
         logger.info("EOD report sent, news cache cleared")
@@ -845,17 +860,556 @@ async def handle_commands():
     except Exception as e:
         logger.error(f"Command handler error: {e}")
 
+
+# ─── FEAR & GREED INDEX ───────────────────────────────────────────────────────
+async def get_fear_greed():
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+            headers = {"User-Agent": "Mozilla/5.0"}
+            async with session.get(url, headers=headers, timeout=10) as r:
+                data = await r.json()
+                score = float(data["fear_and_greed"]["score"])
+                rating = data["fear_and_greed"]["rating"]
+                return {"score": score, "rating": rating}
+    except Exception as e:
+        logger.error(f"Fear & Greed error: {e}")
+        return None
+
+def fear_greed_emoji(score):
+    if score <= 25: return "💀"
+    elif score <= 45: return "😨"
+    elif score <= 55: return "😐"
+    elif score <= 75: return "😊"
+    else: return "🤑"
+
+def fear_greed_color(score):
+    if score <= 25: return "#7a0000"
+    elif score <= 45: return "#b83232"
+    elif score <= 55: return "#a06a10"
+    elif score <= 75: return "#1a7a4a"
+    else: return "#0d5c38"
+
+# ─── TREASURY YIELD MONITOR ───────────────────────────────────────────────────
+TREASURY_ALERT_THRESHOLD = 4.5  # Flag when yield hits this or higher
+
+async def check_treasury_yields():
+    try:
+        async with aiohttp.ClientSession() as session:
+            tickers = {"2yr": "^IRX", "5yr": "^FVX", "10yr": "^TNX", "30yr": "^TYX"}
+            yields = {}
+            for name, ticker in tickers.items():
+                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5d"
+                headers = {"User-Agent": "Mozilla/5.0"}
+                async with session.get(url, headers=headers, timeout=10) as r:
+                    data = await r.json()
+                    result = data["chart"]["result"][0]
+                    closes = [c for c in result["indicators"]["quote"][0]["close"] if c]
+                    if closes:
+                        yields[name] = round(closes[-1], 3)
+                await asyncio.sleep(0.3)
+
+            alerts = []
+            for name, rate in yields.items():
+                if rate >= TREASURY_ALERT_THRESHOLD:
+                    alerts.append(f"{name} at {rate:.2f}% — worth considering locking in")
+            return yields, alerts
+    except Exception as e:
+        logger.error(f"Treasury yield error: {e}")
+        return {}, []
+
+# ─── MARKET GIFT ALERT ────────────────────────────────────────────────────────
+market_gift_fired_today = None
+
+async def check_market_gift():
+    global market_gift_fired_today
+    today = datetime.now(EST).date()
+    if market_gift_fired_today == today:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = "https://query1.finance.yahoo.com/v8/finance/chart/^GSPC?interval=1d&range=5d"
+            headers = {"User-Agent": "Mozilla/5.0"}
+            async with session.get(url, headers=headers, timeout=10) as r:
+                data = await r.json()
+                result = data["chart"]["result"][0]
+                closes = [c for c in result["indicators"]["quote"][0]["close"] if c]
+                if len(closes) >= 2:
+                    current = closes[-1]
+                    prev = closes[-2]
+                    drop = ((prev - current) / prev) * 100
+                    if drop >= 2.0:
+                        market_gift_fired_today = today
+                        if drop >= 3.0:
+                            verdict = "Significant fear-driven selloff"
+                            emoji = "🎁🎁"
+                        else:
+                            verdict = "Minor fear-driven dip"
+                            emoji = "🎁"
+                        msg = (
+                            f"{emoji} *MARKET GIFT ALERT*\n"
+                            "─────────────────────\n"
+                            f"📉 S&P 500 down *{drop:.1f}%* today\n"
+                            "─────────────────────\n"
+                            "This looks like *macro fear*, not fundamental weakness.\n"
+                            "Quality stocks drop with the market for no reason.\n"
+                            "─────────────────────\n"
+                            "👀 *Check your watchlist:*\n"
+                            "PANW · GWRE · WYNN · RKLB\n"
+                            "─────────────────────\n"
+                            f"⚡ {verdict} — DYOR before acting"
+                        )
+                        await send_message(msg)
+    except Exception as e:
+        logger.error(f"Market gift check error: {e}")
+
+# ─── EARNINGS COUNTDOWN ───────────────────────────────────────────────────────
+EARNINGS_CALENDAR = {
+    "SOFI": "2026-05-04",
+    "GWRE": "2026-05-21",
+    "PANW": "2026-05-26",
+    "RKLB": "2026-05-08",
+    "AMZN": "2026-05-01",
+    "GD":   "2026-04-23",
+}
+
+async def check_earnings_countdown():
+    today = datetime.now(EST).date()
+    alerts = []
+    for ticker, date_str in EARNINGS_CALENDAR.items():
+        try:
+            earnings_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            days_away = (earnings_date - today).days
+            if days_away in [2, 1]:
+                alerts.append({
+                    "ticker": ticker,
+                    "date": earnings_date.strftime("%b %d"),
+                    "days": days_away
+                })
+        except:
+            continue
+    for alert in alerts:
+        days_str = "tomorrow" if alert["days"] == 1 else "in 2 days"
+        msg = (
+            f"📅 *EARNINGS ALERT — {alert['ticker']}*\n"
+            f"─────────────────────\n"
+            f"Reports {days_str} — *{alert['date']}*\n"
+            f"─────────────────────\n"
+            f"⚠️ Be prepared for volatility.\n"
+            f"Consider your position size\n"
+            f"before the print drops."
+        )
+        await send_message(msg)
+
+# ─── INSIDER TRADING MONITOR ─────────────────────────────────────────────────
+insider_seen = set()
+
+async def check_insider_trading():
+    tickers = list(HOLDINGS.keys()) + ["PANW", "WYNN", "EE"]
+    stock_tickers = [t for t in tickers if t not in CRYPTO_MAP]
+    try:
+        async with aiohttp.ClientSession() as session:
+            for ticker in stock_tickers:
+                if ticker in CRYPTO_MAP:
+                    continue
+                url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=insiderTransactions"
+                headers = {"User-Agent": "Mozilla/5.0"}
+                async with session.get(url, headers=headers, timeout=10) as r:
+                    data = await r.json()
+                    try:
+                        transactions = data["quoteSummary"]["result"][0]["insiderTransactions"]["transactions"]
+                        for t in transactions[:3]:
+                            trans_id = f"{ticker}_{t.get('startDate', {}).get('raw', 0)}_{t.get('filer', '')}"
+                            if trans_id in insider_seen:
+                                continue
+                            trans_date = t.get("startDate", {}).get("fmt", "")
+                            shares = t.get("shares", {}).get("fmt", "")
+                            value = t.get("value", {}).get("fmt", "")
+                            filer = t.get("filer", "")
+                            relation = t.get("relation", "")
+                            trans_type = t.get("transactionDescription", "")
+                            is_buy = "Purchase" in trans_type or "Acquisition" in trans_type
+                            if is_buy and trans_date:
+                                insider_seen.add(trans_id)
+                                msg = (
+                                    f"🏛️ *INSIDER BUY — {ticker}*\n"
+                                    f"─────────────────────\n"
+                                    f"👤 {filer} ({relation})\n"
+                                    f"📅 {trans_date}\n"
+                                    f"📊 {shares} shares · {value}\n"
+                                    f"─────────────────────\n"
+                                    f"💡 Insiders buy for one reason —\n"
+                                    f"they think the stock is going up."
+                                )
+                                await send_message(msg)
+                    except:
+                        pass
+                await asyncio.sleep(0.5)
+    except Exception as e:
+        logger.error(f"Insider trading error: {e}")
+
+# ─── ECONOMY ARTICLES ─────────────────────────────────────────────────────────
+async def get_economy_articles():
+    try:
+        async with aiohttp.ClientSession() as session:
+            queries = ["economy federal reserve", "stock market outlook"]
+            articles = []
+            for query in queries:
+                url = f"https://newsapi.org/v2/everything?q={query}&sortBy=publishedAt&pageSize=3&language=en&apiKey={NEWS_API_KEY}"
+                async with session.get(url, timeout=10) as r:
+                    data = await r.json()
+                    for a in data.get("articles", [])[:2]:
+                        title = a.get("title", "")
+                        if not title:
+                            continue
+                        non_eng = sum(1 for c in title if ord(c) > 127)
+                        if non_eng > len(title) * 0.15:
+                            continue
+                        articles.append({
+                            "title": title,
+                            "source": a.get("source", {}).get("name", ""),
+                            "url": a.get("url", ""),
+                            "description": a.get("description", "")[:120] if a.get("description") else ""
+                        })
+                        if len(articles) >= 2:
+                            break
+                if len(articles) >= 2:
+                    break
+                await asyncio.sleep(0.5)
+            return articles[:2]
+    except Exception as e:
+        logger.error(f"Economy articles error: {e}")
+        return []
+
+# ─── WEEKLY FRIDAY REPORT ─────────────────────────────────────────────────────
+async def send_weekly_report():
+    logger.info("Sending weekly Friday report...")
+    async with aiohttp.ClientSession() as session:
+        lines = []
+        total_value = 0
+        best = {"ticker": "", "pct": -999}
+        worst = {"ticker": "", "pct": 999}
+
+        for ticker, info in HOLDINGS.items():
+            if ticker in CRYPTO_MAP:
+                price = await get_crypto_price(session, CRYPTO_MAP[ticker])
+            else:
+                price = await get_stock_price(session, ticker)
+            if price:
+                value = price * info["shares"]
+                total_value += value
+                cost = info["avg_cost"] * info["shares"]
+                pl_pct = ((value - cost) / cost) * 100
+                if pl_pct > best["pct"]:
+                    best = {"ticker": ticker, "pct": pl_pct, "price": price}
+                if pl_pct < worst["pct"]:
+                    worst = {"ticker": ticker, "pct": pl_pct, "price": price}
+
+        goal_pct = (total_value / 365000) * 100
+        on_track = total_value >= 291554 * (1 + 0.25 * (datetime.now(EST).month - 3) / 9)
+
+        lines.append("📊 *WEEKLY REPORT*")
+        lines.append(f"📅 {datetime.now(EST).strftime('%A, %b %d')}")
+        lines.append("─" * 28)
+        lines.append(f"💼 *Invested Value:* ${total_value:,.0f}")
+        lines.append(f"🎯 *$365k Goal:* {goal_pct:.1f}%")
+        lines.append(f"{'✅ On track' if on_track else '⚠️ Behind pace'}")
+        lines.append("─" * 28)
+        if best["ticker"]:
+            lines.append(f"🏆 *Best:* {best['ticker']} @ ${best['price']:,.2f} ({best['pct']:+.1f}%)")
+        if worst["ticker"]:
+            lines.append(f"📉 *Weakest:* {worst['ticker']} @ ${worst['price']:,.2f} ({worst['pct']:+.1f}%)")
+        lines.append("─" * 28)
+        lines.append("⚡ _Have a great weekend Patrick_")
+        await send_message("\n".join(lines))
+
+# ─── MONDAY GOAL CHECK ────────────────────────────────────────────────────────
+async def send_monday_goal_check():
+    async with aiohttp.ClientSession() as session:
+        total_value = 0
+        for ticker, info in HOLDINGS.items():
+            if ticker in CRYPTO_MAP:
+                price = await get_crypto_price(session, CRYPTO_MAP[ticker])
+            else:
+                price = await get_stock_price(session, ticker)
+            if price:
+                total_value += price * info["shares"]
+
+        goal_target = 365000
+        gap = goal_target - total_value
+        months_left = max(1, 12 - datetime.now(EST).month + 1)
+        needed_per_month = gap / months_left
+        goal_pct = (total_value / goal_target) * 100
+
+        msg = (
+            f"🎯 *MONDAY GOAL CHECK*\n"
+            f"─────────────────────\n"
+            f"💼 Current: ${total_value:,.0f}\n"
+            f"🏁 Target: $365,000\n"
+            f"📊 Progress: {goal_pct:.1f}%\n"
+            f"─────────────────────\n"
+            f"{'✅ On pace' if gap <= 0 else f'📍 Gap: ${gap:,.0f}'}\n"
+            f"{'🎉 Goal reached!' if gap <= 0 else f'Need ~${needed_per_month:,.0f}/mo to close gap'}\n"
+            f"─────────────────────\n"
+            f"⚡ _Make it a great week_"
+        )
+        await send_message(msg)
+
+# ─── PRE-MARKET BRIEFING — Sent at 8:00am EST via email ──────────────────────
+async def send_premarket_briefing():
+    logger.info("Sending pre-market briefing...")
+    async with aiohttp.ClientSession() as session:
+
+        async def yf(ticker):
+            try:
+                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=30d"
+                headers = {"User-Agent": "Mozilla/5.0"}
+                async with session.get(url, headers=headers, timeout=10) as r:
+                    data = await r.json()
+                    result = data["chart"]["result"][0]
+                    closes = [c for c in result["indicators"]["quote"][0]["close"] if c]
+                    meta = result["meta"]
+                    current = float(meta.get("regularMarketPrice", closes[-1]))
+                    prev = closes[-2] if len(closes) >= 2 else current
+                    chg_pct = ((current - prev) / prev) * 100
+                    high_30d = max(closes)
+                    return {"price": current, "chg": chg_pct, "high_30d": high_30d, "closes": closes}
+            except Exception as e:
+                logger.error(f"Pre-market fetch error {ticker}: {e}")
+                return None
+
+        sp500   = await yf("^GSPC")
+        nasdaq  = await yf("^IXIC")
+        dow     = await yf("^DJI")
+        vix_d   = await yf("^VIX")
+        treasury= await yf("^TNX")
+        dxy     = await yf("DX-Y.NYB")
+        futures = await yf("ES=F")
+        await asyncio.sleep(1)
+
+        score = 0
+        flags = []
+
+        if sp500 and len(sp500["closes"]) >= 20:
+            sma20 = sum(sp500["closes"][-20:]) / 20
+            if sp500["price"] > sma20:
+                score += 2
+                flags.append("S&P above 20-day SMA ✅")
+            else:
+                score -= 2
+                flags.append("S&P below 20-day SMA ⚠️")
+            drawdown = ((sp500["high_30d"] - sp500["price"]) / sp500["high_30d"]) * 100
+            if drawdown > 10:
+                score -= 2
+                flags.append(f"Down {drawdown:.1f}% from 30-day high ⚠️")
+            elif drawdown < 3:
+                score += 1
+                flags.append(f"Near 30-day high ({drawdown:.1f}% below) ✅")
+
+        if vix_d:
+            v = vix_d["price"]
+            if v < 15:
+                score += 2; flags.append(f"VIX {v:.1f} — Very low fear ✅")
+            elif v < 20:
+                score += 1; flags.append(f"VIX {v:.1f} — Calm ✅")
+            elif v < 25:
+                score -= 1; flags.append(f"VIX {v:.1f} — Elevated ⚠️")
+            elif v < 30:
+                score -= 2; flags.append(f"VIX {v:.1f} — High fear 🔴")
+            else:
+                score -= 3; flags.append(f"VIX {v:.1f} — Extreme fear 🔴")
+
+        if futures:
+            fc = futures["chg"]
+            if fc > 0.5:
+                score += 1; flags.append(f"Futures up {fc:.2f}% ✅")
+            elif fc < -0.5:
+                score -= 1; flags.append(f"Futures down {fc:.2f}% ⚠️")
+
+        if treasury:
+            ty = treasury["price"]
+            if ty > 4.5:
+                score -= 1; flags.append(f"10yr yield {ty:.2f}% — Restrictive ⚠️")
+            elif ty < 4.0:
+                score += 1; flags.append(f"10yr yield {ty:.2f}% — Supportive ✅")
+
+        if score >= 4:
+            cond = "BULL"; c_color = "#1a7a4a"; c_bg = "#e8f5ee"; c_emoji = "🟢"
+            rec = "Risk-on environment. Strong momentum. Good conditions for new entries on quality names. Your PANW and GWRE setups look favorable. Watch RKLB toward $100."
+        elif score >= 1:
+            cond = "NEUTRAL"; c_color = "#a06a10"; c_bg = "#fef6e4"; c_emoji = "🟡"
+            rec = "Mixed signals. Proceed selectively. Focus on high-conviction names only. Keep some powder dry and wait for clearer setups before deploying capital."
+        elif score >= -2:
+            cond = "CAUTION"; c_color = "#b83232"; c_bg = "#fceaea"; c_emoji = "🔴"
+            rec = "Risk-off conditions. Hold existing positions but pause new entries. Your cash allocation is a strength right now. Watch VIX for stabilization before acting."
+        else:
+            cond = "BEAR"; c_color = "#7a0000"; c_bg = "#ffe8e8"; c_emoji = "💀"
+            rec = "Bear market conditions. Protect capital first. Consider trimming speculative positions. Cash is a position — hold it and wait for the dust to settle."
+
+        def fmt_price(val):
+            if val is None:
+                return "N/A"
+            return f"{val:,.2f}"
+
+        def idx_row(name, data, invert=False):
+            if not data:
+                return f'<tr><td style="padding:8px 12px;border-bottom:1px solid #f5f5f5;">{name}</td><td colspan="2" style="padding:8px 12px;color:#999;border-bottom:1px solid #f5f5f5;">Unavailable</td></tr>'
+            chg = data["chg"]
+            up_color = "#b83232" if invert else "#1a7a4a"
+            dn_color = "#1a7a4a" if invert else "#b83232"
+            color = up_color if chg >= 0 else dn_color
+            arrow = "▲" if chg >= 0 else "▼"
+            price_str = fmt_price(data["price"])
+            return (
+                '<tr>'
+                '<td style="padding:8px 12px;border-bottom:1px solid #f5f5f5;font-weight:500;font-size:13px;">' + name + '</td>'
+                '<td style="padding:8px 12px;border-bottom:1px solid #f5f5f5;font-size:13px;">' + price_str + '</td>'
+                '<td style="padding:8px 12px;border-bottom:1px solid #f5f5f5;font-size:13px;font-weight:500;color:' + color + ';">' + arrow + ' ' + f"{abs(chg):.2f}%" + '</td>'
+                '</tr>'
+            )
+
+        index_rows = (
+            idx_row("S&P 500", sp500) +
+            idx_row("Nasdaq", nasdaq) +
+            idx_row("Dow Jones", dow) +
+            idx_row("S&P 500 Futures", futures) +
+            idx_row("VIX — Fear Index", vix_d, invert=True) +
+            idx_row("10-yr Treasury", treasury, invert=True) +
+            idx_row("Dollar Index (DXY)", dxy, invert=True)
+        )
+
+        index_table = (
+            '<table width="100%" cellpadding="0" cellspacing="0">'
+            '<tr style="background:#f8f8f8;">'
+            '<th style="padding:8px 12px;text-align:left;font-size:11px;color:#999;font-weight:500;">Index</th>'
+            '<th style="padding:8px 12px;text-align:left;font-size:11px;color:#999;font-weight:500;">Level</th>'
+            '<th style="padding:8px 12px;text-align:left;font-size:11px;color:#999;font-weight:500;">Change</th>'
+            '</tr>' + index_rows + '</table>'
+        )
+
+        flags_html = "".join(
+            '<div style="padding:5px 0;border-bottom:1px solid #f5f5f5;font-size:13px;color:#444;">' + f + '</div>'
+            for f in flags
+        )
+
+        score_sign = "+" + str(score) if score > 0 else str(score)
+        date_str = datetime.now(EST).strftime("%A, %B %d, %Y")
+        date_short = datetime.now(EST).strftime("%a %b %d")
+
+        email_html = (
+            '<html><body style="margin:0;padding:0;background:#f5f5f5;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">'
+            '<table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f5;padding:32px 16px;">'
+            '<tr><td align="center">'
+            '<table width="620" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">'
+            '<tr><td style="background:#0f0f14;padding:24px 28px;">'
+            '<div style="font-size:11px;font-family:monospace;letter-spacing:0.15em;color:#666;text-transform:uppercase;margin-bottom:6px;">Pre-Market Intelligence</div>'
+            '<div style="font-size:24px;font-weight:700;color:#e8c96e;letter-spacing:-0.5px;">Patrick Portfolio Bot</div>'
+            '<div style="font-size:13px;color:#888;margin-top:4px;">' + date_str + ' · 8:00am EST</div>'
+            '</td></tr>'
+            '<tr><td style="background:' + c_bg + ';padding:20px 28px;border-bottom:3px solid ' + c_color + ';">'
+            '<div style="font-size:11px;font-family:monospace;letter-spacing:0.15em;color:' + c_color + ';text-transform:uppercase;margin-bottom:6px;">Market Condition</div>'
+            '<div style="font-size:32px;font-weight:800;color:' + c_color + ';letter-spacing:-1px;">' + c_emoji + ' ' + cond + '</div>'
+            '<div style="font-size:13px;color:' + c_color + ';margin-top:4px;opacity:0.8;">Score: ' + score_sign + ' based on ' + str(len(flags)) + ' signals</div>'
+            '</td></tr>'
+            '<tr><td style="padding:20px 28px 0;">'
+            '<div style="font-size:11px;font-family:monospace;letter-spacing:0.15em;color:#999;text-transform:uppercase;margin-bottom:12px;">Index Snapshot</div>'
+            + index_table +
+            '</td></tr>'
+            '<tr><td style="padding:20px 28px 0;">'
+            '<div style="font-size:11px;font-family:monospace;letter-spacing:0.15em;color:#999;text-transform:uppercase;margin-bottom:12px;">Signal Breakdown</div>'
+            + flags_html +
+            '</td></tr>'
+            '<tr><td style="padding:20px 28px;">'
+            '<div style="font-size:11px;font-family:monospace;letter-spacing:0.15em;color:#999;text-transform:uppercase;margin-bottom:12px;">Recommendation</div>'
+            '<div style="background:' + c_bg + ';border-left:4px solid ' + c_color + ';border-radius:0 8px 8px 0;padding:16px 18px;font-size:14px;color:#1a1a1a;line-height:1.7;">'
+            + rec +
+            '</div>'
+            '</td></tr>'
+            '<tr><td style="padding:0 28px 20px;">'
+            '<div style="font-size:11px;font-family:monospace;letter-spacing:0.15em;color:#999;text-transform:uppercase;margin-bottom:12px;">Your Active Targets</div>'
+            '<div>'
+            '<span style="background:#f0f0f0;padding:5px 10px;border-radius:4px;font-size:12px;font-family:monospace;margin-right:6px;display:inline-block;margin-bottom:6px;">RKLB $100 TRIM</span>'
+            '<span style="background:#f0f0f0;padding:5px 10px;border-radius:4px;font-size:12px;font-family:monospace;margin-right:6px;display:inline-block;margin-bottom:6px;">GWRE $158 ADD</span>'
+            '<span style="background:#f0f0f0;padding:5px 10px;border-radius:4px;font-size:12px;font-family:monospace;margin-right:6px;display:inline-block;margin-bottom:6px;">PANW $160 BUY</span>'
+            '<span style="background:#f0f0f0;padding:5px 10px;border-radius:4px;font-size:12px;font-family:monospace;display:inline-block;margin-bottom:6px;">WYNN $90 BUY</span>'
+            '</div>'
+            '</td></tr>'
+            '<tr><td style="padding:16px 28px;background:#fafafa;border-top:1px solid #f0f0f0;text-align:center;">'
+            '<div style="font-size:11px;color:#bbb;font-family:monospace;">Not financial advice · Patrick Portfolio Bot · ' + date_short + '</div>'
+            '</td></tr>'
+            '</table></td></tr></table>'
+            '</body></html>'
+        )
+
+        # Fear & Greed
+        fg = await get_fear_greed()
+        fg_html = ""
+        if fg:
+            fg_score = fg["score"]
+            fg_color = fear_greed_color(fg_score)
+            fg_emoji = fear_greed_emoji(fg_score)
+            fg_html = (
+                '<tr><td style="padding:20px 28px 0;">'
+                '<div style="font-size:11px;font-family:monospace;letter-spacing:0.15em;color:#999;text-transform:uppercase;margin-bottom:12px;">Fear & Greed Index</div>'
+                '<div style="background:#f8f8f8;border-radius:8px;padding:16px;display:flex;align-items:center;gap:16px;">'
+                '<div style="font-size:36px;font-weight:800;color:' + fg_color + ';">' + fg_emoji + ' ' + str(int(fg_score)) + '</div>'
+                '<div>'
+                '<div style="font-size:14px;font-weight:600;color:' + fg_color + ';">' + fg["rating"].title() + '</div>'
+                '<div style="font-size:12px;color:#999;margin-top:2px;">0 = Extreme Fear · 100 = Extreme Greed</div>'
+                '</div>'
+                '</div>'
+                '</td></tr>'
+            )
+
+        # Treasury yields
+        yields, t_alerts = await check_treasury_yields()
+        treasury_html = ""
+        if yields:
+            yield_rows = "".join(
+                '<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #f5f5f5;font-size:13px;">'
+                '<span style="font-weight:500;">' + k.upper() + ' Treasury</span>'
+                '<span style="color:' + ("#b83232" if v >= TREASURY_ALERT_THRESHOLD else "#333") + ';font-weight:' + ("700" if v >= TREASURY_ALERT_THRESHOLD else "400") + ';">'
+                + str(v) + '%' + (" ← Consider buying" if v >= TREASURY_ALERT_THRESHOLD else "") + '</span>'
+                '</div>'
+                for k, v in yields.items()
+            )
+            treasury_html = (
+                '<tr><td style="padding:20px 28px 0;">'
+                '<div style="font-size:11px;font-family:monospace;letter-spacing:0.15em;color:#999;text-transform:uppercase;margin-bottom:12px;">Treasury Yields</div>'
+                + yield_rows +
+                (''.join('<div style="margin-top:8px;background:#e8f5ee;border-left:3px solid #1a7a4a;padding:10px 12px;font-size:12px;color:#1a7a4a;border-radius:0 6px 6px 0;">💡 ' + a + '</div>' for a in t_alerts) if t_alerts else "") +
+                '</td></tr>'
+            )
+
+        # Rebuild email with F&G and Treasury inserted
+        email_html = email_html.replace(
+            '<tr><td style="padding:0 28px 20px;">',
+            fg_html + treasury_html + '<tr><td style="padding:0 28px 20px;">',
+            1
+        )
+
+        await send_email(c_emoji + " Pre-Market Brief — " + cond + " · " + date_short, email_html)
+        logger.info(f"Pre-market brief sent — condition: {cond} score: {score}")
+
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 async def main():
     logger.info("Patrick's Portfolio Bot starting...")
     await send_message(
         "🤖 *Patrick's Portfolio Bot is LIVE*\n"
         "─────────────────────\n"
+        "✅ Pre-market briefing: 8:00am EST (email)\n"
         "✅ Morning briefs: 9:30am EST\n"
         "✅ Price alerts: Active (Yahoo Finance — real-time)\n"
         "✅ RSI signals: Active\n"
         "✅ MA crossover alerts: Active\n"
         "✅ News: Collected silently → EOD email report\n"
+        "✅ Fear & Greed: Pre-market email daily\n"
+        "✅ Treasury yields: Monitored · Flags compelling rates\n"
+        "✅ Market Gift Alert: Telegram when S&P drops 2%+\n"
+        "✅ Earnings countdown: 2-day heads up\n"
+        "✅ Insider trading: SEC Form 4 monitor\n"
+        "✅ Weekly report: Fridays 4pm\n"
+        "✅ Monday goal check: Every Monday 9am\n"
         "✅ Daily sleeper pick: Active\n"
         "─────────────────────\n"
         "💬 Commands: /brief /prices /watchlist /sleeper /rsi /help\n"
@@ -864,8 +1418,14 @@ async def main():
         "GWRE · MMC · SOFI · BTC"
     )
 
+    premarket_sent_today = None
     morning_brief_sent_today = None
     eod_sent_today = None
+    weekly_report_sent = None
+    monday_check_sent = None
+    last_insider_check = None
+    last_earnings_check = None
+    last_gift_check = None
     last_price_check = None
     last_rsi_check = None
     last_ma_check = None
@@ -874,6 +1434,13 @@ async def main():
     while True:
             now = datetime.now(EST)
             today = now.date()
+
+            # Pre-market briefing at 8:00am EST weekdays
+            if (now.weekday() < 5 and now.hour == 8 and
+                    now.minute >= 0 and now.minute <= 5 and
+                    premarket_sent_today != today):
+                await send_premarket_briefing()
+                premarket_sent_today = today
 
             # Morning brief at 9:30am EST weekdays
             if is_morning_brief_time() and morning_brief_sent_today != today:
@@ -910,6 +1477,39 @@ async def main():
                     eod_sent_today != today):
                 await send_eod_report()
                 eod_sent_today = today
+
+            # Weekly Friday report at 4:00pm
+            if (now.weekday() == 4 and now.hour == 16 and
+                    now.minute >= 0 and now.minute <= 5 and
+                    weekly_report_sent != today):
+                await send_weekly_report()
+                weekly_report_sent = today
+
+            # Monday goal check at 9:00am
+            if (now.weekday() == 0 and now.hour == 9 and
+                    now.minute >= 0 and now.minute <= 5 and
+                    monday_check_sent != today):
+                await send_monday_goal_check()
+                monday_check_sent = today
+
+            # Earnings countdown check once daily at 8:30am
+            if (now.weekday() < 5 and now.hour == 8 and
+                    now.minute >= 30 and now.minute <= 35 and
+                    last_earnings_check != today):
+                await check_earnings_countdown()
+                last_earnings_check = today
+
+            # Insider trading check every 4 hours during market hours
+            if is_market_open():
+                if not last_insider_check or (now - last_insider_check).seconds >= 14400:
+                    await check_insider_trading()
+                    last_insider_check = now
+
+            # Market gift check every 30 minutes during market hours
+            if is_market_open():
+                if not last_gift_check or (now - last_gift_check).seconds >= 1800:
+                    await check_market_gift()
+                    last_gift_check = now
 
             # Check for commands every 3 seconds
             await handle_commands()
