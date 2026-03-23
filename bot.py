@@ -62,6 +62,36 @@ NEWS_TICKERS = ["RKLB", "GWRE", "SOFI", "PANW", "AMZN", "GD", "BTC", "ETH", "WYN
 seen_news = set()
 fired_alerts = {}
 
+# ─── LANGUAGE FILTER HELPERS ──────────────────────────────────────────────────
+NON_ENGLISH_SOURCES = [
+    "larazon", "republica.com", "lanacion", "aristeguinoticias",
+    "criptonoticias", "stern.de", "spiegel", "lemonde", "elpais",
+    "lavanguardia", "clarin", "infobae", "telam", "univision",
+    "telemundo", "expansion.mx", "milenio", "excelsior"
+]
+
+NON_ENGLISH_KEYWORDS = [
+    " de ", " la ", " el ", " en ", " es ", " que ", " del ",
+    " los ", " las ", " por ", " con ", " para ", " una ", " ein ",
+    " der ", " die ", " das ", " und ", " von ", " le ", " les ",
+    " des ", " sur ", " est ", " par "
+]
+
+def is_non_english(title, source="", url=""):
+    if not title:
+        return True
+    non_english_chars = sum(1 for c in title if ord(c) > 127)
+    if non_english_chars > len(title) * 0.05:
+        return True
+    source_lower = source.lower()
+    url_lower = url.lower()
+    if any(s in source_lower or s in url_lower for s in NON_ENGLISH_SOURCES):
+        return True
+    title_lower = title.lower()
+    if any(kw in title_lower for kw in NON_ENGLISH_KEYWORDS):
+        return True
+    return False
+
 # ─── PRICE FETCHING ───────────────────────────────────────────────────────────
 async def get_stock_price(session, ticker):
     try:
@@ -77,7 +107,6 @@ async def get_stock_price(session, ticker):
 
 async def get_crypto_price(session, coin_id):
     try:
-        # Map coin_id to Yahoo Finance ticker
         ticker_map = {"bitcoin": "BTC-USD", "ethereum": "ETH-USD"}
         ticker = ticker_map.get(coin_id, f"{coin_id.upper()}-USD")
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d"
@@ -292,7 +321,6 @@ async def send_morning_brief():
     async with aiohttp.ClientSession() as session:
         lines = []
         total_value = 0
-        total_cost = 0
 
         lines.append("☀️ *PATRICK'S MORNING BRIEF*")
         lines.append(f"📅 {datetime.now(EST).strftime('%A, %b %d %Y · %I:%M %p EST')}")
@@ -318,13 +346,6 @@ async def send_morning_brief():
 
         await send_message("\n".join(lines))
 
-        # Also send morning brief as HTML email
-        holdings_html = "".join(
-            f'<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #f5f5f5;">'
-            f'<span style="font-weight:500;">{line.replace("📌 *","").replace("* —","")[:30]}</span>'
-            f'</div>'
-            for line in lines if line.startswith("📌")
-        )
         email_html = build_email(
             f"Morning Brief · {datetime.now(EST).strftime('%A, %b %d')}",
             [
@@ -337,7 +358,6 @@ async def send_morning_brief():
         )
         await send_email(f"☀️ Morning Brief — {datetime.now(EST).strftime('%a %b %d')}", email_html)
 
-        # Send sleeper pick right after morning brief
         await asyncio.sleep(3)
         await send_sleeper_pick(session)
 
@@ -612,15 +632,17 @@ async def collect_news():
                 articles = await get_news(session, ticker)
                 for article in articles:
                     title = article.get("title", "")
-                    # Filter non-English articles
-                    if not title:
+                    source = article.get("source", "")
+                    url = article.get("url", "")
+
+                    # ── English-only filter ──
+                    if is_non_english(title, source, url):
                         continue
-                    non_english_chars = sum(1 for c in title if ord(c) > 127)
-                    if non_english_chars > len(title) * 0.2:
-                        continue
-                    cache_key = article.get("url", "")
+
+                    cache_key = url
                     if cache_key in [n.get("url") for n in daily_news_cache]:
                         continue
+
                     move_pct = 0
                     direction = ""
                     if current and prev:
@@ -629,8 +651,8 @@ async def collect_news():
                     daily_news_cache.append({
                         "ticker": ticker,
                         "title": title,
-                        "source": article.get("source", ""),
-                        "url": article.get("url", ""),
+                        "source": source,
+                        "url": url,
                         "move_pct": move_pct,
                         "direction": direction,
                         "price": current
@@ -722,28 +744,7 @@ async def send_eod_report():
         goal_pct = min((total_value / 365000) * 100, 100)
         goal_bar_width = int(goal_pct)
 
-        email_html = build_email(
-            f"End of Day Report · {datetime.now(EST).strftime('%A, %b %d, %Y')}",
-            [
-                {"label": "Portfolio Close", "content": prices_table},
-                {"label": "Watchlist Status", "content": watch_html},
-                {"label": "Today's News (English only)", "content": news_html},
-                {"label": "$365k Goal Progress", "content": f"""
-                    <div style="font-size:22px;font-weight:700;color:#e8a030;">{goal_pct:.1f}%</div>
-                    <div style="background:#f0f0f0;border-radius:4px;height:10px;margin:10px 0;overflow:hidden;">
-                        <div style="background:#e8a030;height:100%;width:{goal_bar_width}%;border-radius:4px;"></div>
-                    </div>
-                    <div style="font-size:13px;color:#666;">Invested value: ${total_value:,.0f} · Gap to $365k: ${max(365000-total_value,0):,.0f}</div>
-                """},
-            ]
-        )
-
-        await send_email(
-            f"📊 EOD Report — {datetime.now(EST).strftime('%a %b %d')}",
-            email_html
-        )
-
-        # Economy articles
+        # Economy articles — fetch before building email
         eco_articles = await get_economy_articles()
         eco_html = ""
         if eco_articles:
@@ -757,6 +758,29 @@ async def send_eod_report():
                 )
         else:
             eco_html = '<div style="color:#999;font-size:13px;">No economy articles today.</div>'
+
+        # Build and send full email
+        email_html = build_email(
+            f"End of Day Report · {datetime.now(EST).strftime('%A, %b %d, %Y')}",
+            [
+                {"label": "Portfolio Close", "content": prices_table},
+                {"label": "Watchlist Status", "content": watch_html},
+                {"label": "Today's News (English only)", "content": news_html},
+                {"label": "$365k Goal Progress", "content": f"""
+                    <div style="font-size:22px;font-weight:700;color:#e8a030;">{goal_pct:.1f}%</div>
+                    <div style="background:#f0f0f0;border-radius:4px;height:10px;margin:10px 0;overflow:hidden;">
+                        <div style="background:#e8a030;height:100%;width:{goal_bar_width}%;border-radius:4px;"></div>
+                    </div>
+                    <div style="font-size:13px;color:#666;">Invested value: ${total_value:,.0f} · Gap to $365k: ${max(365000-total_value,0):,.0f}</div>
+                """},
+                {"label": "Economy & Macro", "content": eco_html},
+            ]
+        )
+
+        await send_email(
+            f"📊 EOD Report — {datetime.now(EST).strftime('%a %b %d')}",
+            email_html
+        )
 
         # Clear news cache for tomorrow
         daily_news_cache.clear()
@@ -891,7 +915,7 @@ def fear_greed_color(score):
     else: return "#0d5c38"
 
 # ─── TREASURY YIELD MONITOR ───────────────────────────────────────────────────
-TREASURY_ALERT_THRESHOLD = 4.5  # Flag when yield hits this or higher
+TREASURY_ALERT_THRESHOLD = 4.5
 
 async def check_treasury_yields():
     try:
@@ -1055,20 +1079,22 @@ async def get_economy_articles():
             queries = ["economy federal reserve", "stock market outlook"]
             articles = []
             for query in queries:
-                url = f"https://newsapi.org/v2/everything?q={query}&sortBy=publishedAt&pageSize=3&language=en&apiKey={NEWS_API_KEY}"
+                url = f"https://newsapi.org/v2/everything?q={query}&sortBy=publishedAt&pageSize=5&language=en&apiKey={NEWS_API_KEY}"
                 async with session.get(url, timeout=10) as r:
                     data = await r.json()
-                    for a in data.get("articles", [])[:2]:
+                    for a in data.get("articles", []):
                         title = a.get("title", "")
-                        if not title:
+                        source = a.get("source", {}).get("name", "")
+                        art_url = a.get("url", "")
+
+                        # ── English-only filter ──
+                        if is_non_english(title, source, art_url):
                             continue
-                        non_eng = sum(1 for c in title if ord(c) > 127)
-                        if non_eng > len(title) * 0.15:
-                            continue
+
                         articles.append({
                             "title": title,
-                            "source": a.get("source", {}).get("name", ""),
-                            "url": a.get("url", ""),
+                            "source": source,
+                            "url": art_url,
                             "description": a.get("description", "")[:120] if a.get("description") else ""
                         })
                         if len(articles) >= 2:
@@ -1415,7 +1441,7 @@ async def main():
         "💬 Commands: /brief /prices /watchlist /sleeper /rsi /help\n"
         "─────────────────────\n"
         "Tracking: RKLB · VTI · ETH · GD · AMZN\n"
-        "GWRE · MMC · SOFI · BTC"
+        "GWRE · MRSH · SOFI · BTC"
     )
 
     premarket_sent_today = None
