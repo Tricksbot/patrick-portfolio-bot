@@ -83,7 +83,7 @@ fired_alerts     = {}
 daily_news_cache = []
 market_gift_fired_today = None
 insider_seen     = set()
-intraday_prices  = {}   # tracks prices for "why did this move" detection
+intraday_prices  = {}
 consider_buying_fired_today = set()
 
 TRUSTED_SOURCES = [
@@ -123,10 +123,103 @@ SLEEPER_WATCHLIST = [
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ─── MARKET MEMORY ────────────────────────────────────────────────────────────
+# Stores daily market verdicts + outcomes to build context over time
+# ═══════════════════════════════════════════════════════════════════════════════
+MEMORY_FILE = "market_memory.json"
+
+def load_memory():
+    try:
+        if os.path.exists(MEMORY_FILE):
+            with open(MEMORY_FILE, "r") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error(f"Memory load error: {e}")
+    return {"daily": [], "conviction_scores": {}}
+
+def save_memory(memory):
+    try:
+        with open(MEMORY_FILE, "w") as f:
+            json.dump(memory, f, indent=2)
+    except Exception as e:
+        logger.error(f"Memory save error: {e}")
+
+def record_daily_verdict(cond, score, sp_chg, verdict_summary):
+    """Store today's market verdict for future context."""
+    memory = load_memory()
+    today_str = datetime.now(EST).strftime("%Y-%m-%d")
+
+    # Avoid duplicate entries for the same day
+    memory["daily"] = [d for d in memory["daily"] if d["date"] != today_str]
+
+    memory["daily"].append({
+        "date": today_str,
+        "condition": cond,
+        "score": score,
+        "sp_change": round(sp_chg, 2),
+        "verdict_summary": verdict_summary[:200],
+        "outcome": None  # filled in by evening update
+    })
+
+    # Keep only last 30 days
+    memory["daily"] = memory["daily"][-30:]
+    save_memory(memory)
+
+def update_yesterday_outcome(sp_chg_today):
+    """Update yesterday's entry with what actually happened."""
+    memory = load_memory()
+    if len(memory["daily"]) >= 2:
+        yesterday = memory["daily"][-2]
+        if yesterday.get("outcome") is None:
+            yesterday["outcome"] = round(sp_chg_today, 2)
+            # Was the verdict directionally correct?
+            predicted_bull = yesterday["condition"] in ["BULL", "NEUTRAL"]
+            actual_bull    = sp_chg_today >= 0
+            yesterday["correct"] = predicted_bull == actual_bull
+            save_memory(memory)
+
+def get_memory_context():
+    """Build a context string from recent market memory for AI prompts."""
+    memory = load_memory()
+    daily  = memory.get("daily", [])
+    if not daily:
+        return ""
+
+    lines = ["Recent market history (last 5 days):"]
+    for entry in daily[-5:]:
+        outcome_str = ""
+        if entry.get("outcome") is not None:
+            correct = "✓ correct call" if entry.get("correct") else "✗ missed call"
+            outcome_str = f" → S&P actually {entry['outcome']:+.2f}% ({correct})"
+        lines.append(
+            f"  {entry['date']}: {entry['condition']} (score {entry['score']}){outcome_str}"
+        )
+
+    # Accuracy summary
+    completed = [d for d in daily if d.get("outcome") is not None]
+    if completed:
+        correct_count = sum(1 for d in completed if d.get("correct"))
+        accuracy = (correct_count / len(completed)) * 100
+        lines.append(f"Recent accuracy: {correct_count}/{len(completed)} calls correct ({accuracy:.0f}%)")
+
+    return "\n".join(lines)
+
+def save_conviction_scores(scores_dict):
+    """Store weekly conviction scores for each holding."""
+    memory = load_memory()
+    today  = datetime.now(EST).strftime("%Y-%m-%d")
+    memory["conviction_scores"][today] = scores_dict
+    # Keep only last 8 weeks
+    keys = sorted(memory["conviction_scores"].keys())
+    if len(keys) > 8:
+        for old_key in keys[:-8]:
+            del memory["conviction_scores"][old_key]
+    save_memory(memory)
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # ─── CLAUDE API ───────────────────────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════════
 async def ask_claude(prompt, system=None, max_tokens=600):
-    """Call Claude API and return response text."""
     if not ANTHROPIC_API_KEY:
         return None
     try:
@@ -145,9 +238,7 @@ async def ask_claude(prompt, system=None, max_tokens=600):
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=body,
-                timeout=30
+                headers=headers, json=body, timeout=30
             ) as r:
                 data = await r.json()
                 if data.get("content"):
@@ -156,8 +247,8 @@ async def ask_claude(prompt, system=None, max_tokens=600):
         logger.error(f"Claude API error: {e}")
     return None
 
+# ─── AI: Morning Verdict ──────────────────────────────────────────────────────
 async def get_ai_morning_verdict(market_data):
-    """Generate AI-written morning market verdict paragraph."""
     sp  = market_data.get("sp500")
     vix = market_data.get("vix_d")
     fut = market_data.get("futures")
@@ -171,74 +262,212 @@ async def get_ai_morning_verdict(market_data):
     fg_val    = f"{int(fg['score'])} ({fg['rating']})" if fg else "unavailable"
     score     = market_data.get("score", 0)
     cond      = market_data.get("cond", "NEUTRAL")
-    flags     = market_data.get("flags", [])
-    flags_str = "\n".join(f"- {t} {txt}" for t, txt in flags)
-
-    # Portfolio context
-    holdings_str = ", ".join(
-        f"{t} (avg cost ${i['avg_cost']})"
-        for t, i in HOLDINGS.items()
-        if t not in CRYPTO_MAP
-    )
+    flags_str = "\n".join(f"- {t} {txt}" for t, txt in market_data.get("flags", []))
+    memory_ctx = get_memory_context()
+    holdings_str = ", ".join(f"{t} (avg ${i['avg_cost']})" for t, i in HOLDINGS.items() if t not in CRYPTO_MAP)
 
     prompt = f"""You are a professional financial analyst writing a daily market outlook for Patrick, a private investor.
 
 Today's market data:
 - S&P 500: {sp_price}
-- VIX (fear index): {vix_val}
-- S&P Futures: {fut_chg}
-- 10-year Treasury yield: {tsy_val}
-- Fear & Greed Index: {fg_val}
-- Overall market score: {score}/10 — condition: {cond}
-- Signal breakdown:
+- VIX: {vix_val}
+- Futures: {fut_chg}
+- 10yr Treasury: {tsy_val}
+- Fear & Greed: {fg_val}
+- Condition: {cond} (score {score})
+- Signals:
 {flags_str}
 
-Patrick's stock holdings: {holdings_str}
+{memory_ctx}
+
+Patrick's holdings: {holdings_str}
 Patrick's watchlist: PANW (target $160), WYNN (target $90)
-Patrick's goal: grow portfolio to $365,000 by end of 2026
+Patrick's goal: $365,000 by end of 2026
 
-Write a single paragraph (4-6 sentences) market outlook for today. Be professional but conversational — like a trusted advisor talking directly to Patrick. Reference specific data points naturally. Mention 1-2 of his holdings or watchlist names if relevant to today's conditions. Do not use bullet points, headers, or markdown. Do not say "Patrick" more than once. End with one clear, actionable takeaway for today."""
+Write a single paragraph (4-6 sentences) market outlook. Professional but conversational — like a trusted advisor. Reference specific data naturally. Mention 1-2 holdings or watchlist names if relevant. No bullets, headers, or markdown. Don't say "Patrick" more than once. End with one clear actionable takeaway."""
 
-    result = await ask_claude(prompt, max_tokens=300)
-    return result
+    return await ask_claude(prompt, max_tokens=300)
 
+# ─── AI: Evening Wrap ────────────────────────────────────────────────────────
+async def get_ai_evening_wrap(market_data, prices_data, total_value, news_items):
+    sp     = market_data.get("sp500")
+    vix    = market_data.get("vix_d")
+    cond   = market_data.get("cond", "NEUTRAL")
+    sp_chg = sp["chg"] if sp else 0
+    vix_v  = vix["price"] if vix else 0
+
+    # Portfolio summary
+    movers = []
+    for ticker, info, price, prev in prices_data:
+        if price and prev:
+            chg = ((price - prev) / prev) * 100
+            if abs(chg) >= 1.5:
+                movers.append(f"{ticker} {chg:+.1f}%")
+
+    # News headlines
+    headlines = [n["title"] for n in (news_items or [])[:5]]
+    headlines_str = "\n".join(f"- {h}" for h in headlines) if headlines else "- No major headlines"
+
+    # Memory context
+    memory_ctx = get_memory_context()
+
+    prompt = f"""You are writing the evening market wrap for Patrick, a private investor. Be his trusted advisor — direct, insightful, and forward-looking.
+
+Today's closing data:
+- S&P 500: {sp_chg:+.2f}% — condition: {cond}
+- VIX: {vix_v:.1f}
+- Notable portfolio movers today: {', '.join(movers) if movers else 'No major moves'}
+- Portfolio total value: ${total_value:,.0f} (goal: $365,000)
+
+Today's key headlines:
+{headlines_str}
+
+{memory_ctx}
+
+Write 2 short paragraphs:
+1. What happened today — the story behind the numbers, what drove the market, what mattered for Patrick's portfolio specifically.
+2. What to watch tomorrow — one or two things to keep an eye on, based on today's action and what's coming up.
+
+Professional but conversational. No bullets or headers. No markdown. Don't be generic — reference specific things that actually happened today."""
+
+    return await ask_claude(prompt, max_tokens=350)
+
+# ─── AI: Conviction Scores ───────────────────────────────────────────────────
+async def get_ai_conviction_scores(prices_data, market_data):
+    """Generate 1-10 conviction score for each holding with reasoning."""
+    cond  = market_data.get("cond", "NEUTRAL")
+    score = market_data.get("score", 0)
+
+    holdings_context = []
+    for ticker, info, price, prev in prices_data:
+        if not price: continue
+        cost     = info["avg_cost"] * info["shares"]
+        value    = price * info["shares"]
+        pl_pct   = ((value - cost) / cost) * 100
+        day_chg  = ((price - prev) / prev) * 100 if prev else 0
+        holdings_context.append(
+            f"  {ticker} ({info['name']}): ${price:,.2f} | {pl_pct:+.1f}% total P&L | {day_chg:+.1f}% today"
+        )
+
+    holdings_str = "\n".join(holdings_context)
+
+    prompt = f"""You are a portfolio analyst scoring each of Patrick's holdings on a 1-10 conviction scale.
+
+Market context: {cond} conditions (score {score})
+
+Patrick's holdings:
+{holdings_str}
+
+For each ticker, provide a score from 1-10 and one sentence of reasoning.
+- 8-10: Strong conviction, hold or add
+- 5-7: Neutral, monitor
+- 1-4: Low conviction, consider reducing
+
+Respond in this exact format (one per line, nothing else):
+TICKER|SCORE|One sentence reasoning
+
+Example:
+RKLB|8|Strong momentum with clear path to $100 trim target still intact.
+
+Score every ticker listed above. Be direct and honest."""
+
+    result = await ask_claude(prompt, max_tokens=400)
+    if not result:
+        return {}
+
+    scores = {}
+    for line in result.strip().split("\n"):
+        parts = line.strip().split("|")
+        if len(parts) == 3:
+            ticker, score_str, reasoning = parts
+            ticker = ticker.strip().upper()
+            try:
+                scores[ticker] = {
+                    "score": int(score_str.strip()),
+                    "reasoning": reasoning.strip()
+                }
+            except:
+                continue
+    return scores
+
+# ─── AI: Portfolio Coaching ──────────────────────────────────────────────────
+async def get_ai_portfolio_coaching(prices_data, total_value, market_data, period="weekly"):
+    """Generate portfolio coaching advice for Monday or Friday emails."""
+    cond  = market_data.get("cond", "NEUTRAL")
+    score = market_data.get("score", 0)
+
+    # Build full portfolio picture
+    portfolio_lines = []
+    total_cost = 0
+    for ticker, info, price, prev in prices_data:
+        if not price: continue
+        cost   = info["avg_cost"] * info["shares"]
+        value  = price * info["shares"]
+        pl_pct = ((value - cost) / cost) * 100
+        total_cost += cost
+        portfolio_lines.append(f"  {ticker}: ${price:,.2f} | {pl_pct:+.1f}% P&L | ${value:,.0f} value")
+
+    portfolio_str = "\n".join(portfolio_lines)
+    total_pl      = ((total_value - total_cost) / total_cost) * 100 if total_cost > 0 else 0
+    gap           = max(365000 - total_value, 0)
+    months_left   = max(1, 12 - datetime.now(EST).month + 1)
+    memory_ctx    = get_memory_context()
+
+    if period == "monday":
+        timing = "week ahead"
+        tone   = "Set the tone for the week. Be motivating but honest."
+    else:
+        timing = "week in review"
+        tone   = "Reflect on what happened. Be direct about what worked and what didn't."
+
+    prompt = f"""You are Patrick's personal portfolio coach writing a {timing} assessment.
+
+Portfolio snapshot:
+{portfolio_str}
+
+Total value: ${total_value:,.0f} | Total P&L: {total_pl:+.1f}%
+Goal: $365,000 by end of 2026 | Gap: ${gap:,.0f} | Months left: {months_left}
+Market condition: {cond} (score {score})
+
+{memory_ctx}
+
+Write a coaching paragraph (4-5 sentences) that:
+- Assesses the overall portfolio health honestly
+- Calls out 1-2 specific positions that need attention (good or bad)
+- Gives clear guidance on whether to be conservative or aggressive right now given market conditions
+- Ties everything back to the $365k goal
+
+{tone} Professional but conversational — like a coach talking directly to Patrick. No bullets or headers. No markdown."""
+
+    return await ask_claude(prompt, max_tokens=300)
+
+# ─── AI: Consider Buying ─────────────────────────────────────────────────────
 async def get_ai_consider_buying(ticker, name, sector, price, rsi, drawdown, sma20, sma50, macd_signal, news_headlines, insider_buy=False):
-    """Generate AI-powered Consider Buying conviction alert."""
     headlines_str = "\n".join(f"- {h}" for h in news_headlines) if news_headlines else "- No recent headlines"
-
     prompt = f"""You are a professional stock analyst. Evaluate whether this stock is worth buying right now.
 
-Stock: {name} ({ticker})
-Sector: {sector}
-Current price: ${price:,.2f}
-RSI (14-day): {rsi} — {'oversold' if rsi <= 35 else 'neutral' if rsi <= 55 else 'elevated'}
-Drawdown from 52-week high: {drawdown:.1f}%
-Price vs SMA20: {'above' if price > sma20 else 'below'} (${sma20:,.2f})
-Price vs SMA50: {'above' if price > sma50 else 'below'} (${sma50:,.2f})
-MACD signal: {macd_signal}
-Insider buying recently: {'Yes' if insider_buy else 'No'}
+Stock: {name} ({ticker}) — {sector}
+Price: ${price:,.2f} | RSI: {rsi} | Down {drawdown:.1f}% from 52w high
+vs SMA20: {'above' if price > sma20 else 'below'} (${sma20:,.2f}) | vs SMA50: {'above' if price > sma50 else 'below'} (${sma50:,.2f})
+MACD: {macd_signal} | Insider buying: {'Yes' if insider_buy else 'No'}
 Recent news:
 {headlines_str}
 
-Write a 3-4 sentence "Consider Buying" alert for Patrick, a private investor. Be direct and specific — tell him exactly why this setup is compelling right now, what the risk is, and what price level matters. Professional but conversational tone. No bullet points or headers. End with a clear conviction level: LOW, MEDIUM, or HIGH."""
+Write a 3-4 sentence "Consider Buying" alert for Patrick. Be direct — tell him exactly why this setup is compelling, what the risk is, and what price level matters. End with conviction level: LOW, MEDIUM, or HIGH."""
+    return await ask_claude(prompt, max_tokens=250)
 
-    result = await ask_claude(prompt, max_tokens=250)
-    return result
-
+# ─── AI: Ask Response ────────────────────────────────────────────────────────
 async def get_ai_ask_response(question, market_data, portfolio_prices):
-    """Answer Patrick's /ask question with full context."""
-    # Build portfolio summary
     portfolio_lines = []
     total_value = 0
     for ticker, info, price, prev in portfolio_prices:
         if price:
-            value = price * info["shares"]
-            total_value += value
+            value = price * info["shares"]; total_value += value
             cost  = info["avg_cost"] * info["shares"]
             pl    = ((value - cost) / cost) * 100
-            portfolio_lines.append(f"  {ticker}: ${price:,.2f} | {pl:+.1f}% total P&L | ${value:,.0f} value")
+            portfolio_lines.append(f"  {ticker}: ${price:,.2f} | {pl:+.1f}% P&L | ${value:,.0f}")
 
-    portfolio_str = "\n".join(portfolio_lines)
+    memory_ctx = get_memory_context()
     cond  = market_data.get("cond", "NEUTRAL")
     score = market_data.get("score", 0)
     sp    = market_data.get("sp500")
@@ -246,43 +475,34 @@ async def get_ai_ask_response(question, market_data, portfolio_prices):
     sp_str  = f"${sp['price']:,.0f} ({sp['chg']:+.2f}%)" if sp else "unavailable"
     vix_str = f"{vix['price']:.1f}" if vix else "unavailable"
 
-    system = """You are Patrick's personal AI investment advisor. You have full context of his portfolio, market conditions, and his goal of reaching $365,000 by end of 2026. Give direct, honest, actionable answers. Be conversational but professional. Never give generic disclaimers — give real analysis. Keep answers concise (3-5 sentences max unless the question genuinely requires more detail). Always factor in his specific holdings and goal when relevant."""
+    system = """You are Patrick's personal AI investment advisor. Give direct, honest, actionable answers. Be conversational but professional. Never give generic disclaimers — give real analysis. Keep answers concise (3-5 sentences max). Always factor in his specific holdings and $365k goal."""
 
     prompt = f"""Patrick's question: "{question}"
 
-Current market:
-- Condition: {cond} (score {score})
-- S&P 500: {sp_str}
-- VIX: {vix_str}
-- Today: {datetime.now(EST).strftime('%A, %B %d, %Y')}
+Market: {cond} (score {score}) | S&P: {sp_str} | VIX: {vix_str}
+Date: {datetime.now(EST).strftime('%A, %B %d, %Y')}
 
-Patrick's portfolio (total ~${total_value:,.0f}):
-{portfolio_str}
+Portfolio (total ~${total_value:,.0f}):
+{chr(10).join(portfolio_lines)}
 
-Watchlist: PANW (target $160), WYNN (target $90)
+Watchlist: PANW ($160), WYNN ($90)
 Goal: $365,000 by end of 2026 — gap: ${max(365000 - total_value, 0):,.0f}
+
+{memory_ctx}
 
 Answer his question directly."""
 
-    result = await ask_claude(prompt, system=system, max_tokens=400)
-    return result
+    return await ask_claude(prompt, system=system, max_tokens=400)
 
+# ─── AI: Move Explanation ────────────────────────────────────────────────────
 async def get_ai_move_explanation(ticker, name, move_pct, direction, news_headlines, market_chg):
-    """Explain why a stock moved significantly."""
     headlines_str = "\n".join(f"- {h}" for h in news_headlines) if news_headlines else "- No headlines found"
     move_dir = "up" if move_pct > 0 else "down"
-
     prompt = f"""Explain in 2-3 sentences why {name} ({ticker}) is {move_dir} {abs(move_pct):.1f}% today.
-
-Context:
-- S&P 500 is {'+' if market_chg >= 0 else ''}{market_chg:.2f}% today (so this move is {'with' if (move_pct > 0) == (market_chg > 0) else 'against'} the broader market)
-- Today's news headlines about {ticker}:
-{headlines_str}
-
-Be direct and specific. If the move appears to be just market-driven with no specific catalyst, say so clearly. Professional but conversational tone. No bullet points."""
-
-    result = await ask_claude(prompt, max_tokens=150)
-    return result
+S&P 500 is {market_chg:+.2f}% today. This move is {'with' if (move_pct > 0) == (market_chg > 0) else 'against'} the market.
+News: {headlines_str}
+Be direct. If no specific catalyst, say so clearly. No bullets."""
+    return await ask_claude(prompt, max_tokens=150)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -668,6 +888,32 @@ def portfolio_table_html(prices_data):
             '<th style="padding:7px 10px;text-align:right;font-size:11px;color:#999;font-weight:500;">Total P&L</th></tr>'
             + rows + '</table>')
 
+def conviction_scores_html(scores):
+    """Render conviction scores as a clean table."""
+    if not scores:
+        return '<div style="color:#999;font-size:13px;">Conviction scores unavailable today.</div>'
+    rows = ""
+    for ticker, data in scores.items():
+        score = data["score"]
+        reasoning = data["reasoning"]
+        if score >= 8:     score_color, score_bg, label = "#166534", "#f0fff4", "Strong Hold/Add"
+        elif score >= 6:   score_color, score_bg, label = "#a06a10", "#fef6e4", "Neutral/Monitor"
+        elif score >= 4:   score_color, score_bg, label = "#b83232", "#fff0f0", "Watch Closely"
+        else:              score_color, score_bg, label = "#7a0000", "#ffe8e8", "Consider Reducing"
+        bar_width = score * 10
+        rows += (
+            f'<div style="padding:10px 0;border-bottom:1px solid #f5f5f5;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+            f'<span style="font-weight:600;font-size:13px;">{ticker}</span>'
+            f'<span style="background:{score_bg};color:{score_color};font-size:12px;font-weight:700;padding:3px 10px;border-radius:4px;">{score}/10 — {label}</span>'
+            f'</div>'
+            f'<div style="background:#f0f0f0;border-radius:3px;height:4px;margin-bottom:6px;overflow:hidden;">'
+            f'<div style="background:{score_color};height:100%;width:{bar_width}%;border-radius:3px;"></div></div>'
+            f'<div style="font-size:12px;color:#555;line-height:1.5;">{reasoning}</div>'
+            f'</div>'
+        )
+    return rows if rows else '<div style="color:#999;font-size:13px;">No scores available.</div>'
+
 def goal_bar_html(total_value, goal=365000):
     pct = min((total_value / goal) * 100, 100)
     gap = max(goal - total_value, 0)
@@ -714,8 +960,6 @@ async def send_morning_email():
         ms     = await get_market_score(session)
         fg     = await get_fear_greed()
         yields = await get_treasury_yields()
-
-        # Attach fear & greed to market data for AI
         ms["fear_greed"] = fg
 
         overnight_news = await get_news(session, "stock market economy", max_articles=4)
@@ -723,18 +967,21 @@ async def send_morning_email():
         for ticker in ["RKLB", "AMZN", "GWRE", "SOFI", "GD"]:
             articles = await get_news(session, ticker, max_articles=1)
             for a in articles:
-                a["ticker"] = ticker
-                holdings_news.append(a)
+                a["ticker"] = ticker; holdings_news.append(a)
 
-        # ── AI VERDICT ──
         ai_verdict = await get_ai_morning_verdict(ms)
         fallback_verdict = {
-            "BULL":    "Market conditions look constructive heading into today's session. Momentum is on the side of the bulls — the trend is intact, volatility is contained, and there's no major macro pressure. This is an environment where quality setups are worth acting on.",
-            "NEUTRAL": "The market is sending mixed signals today. This isn't a day to be aggressive or defensive. Focus on your highest-conviction ideas only and keep position sizing in check.",
-            "CAUTION": "Conditions have shifted to cautious today. The risk/reward on new entries isn't favorable right now. Hold your existing positions and resist the urge to add until the market shows stabilization.",
-            "BEAR":    "This is a risk-off day. Multiple signals are flashing red. Capital preservation takes priority — now is not the time to be a hero."
+            "BULL":    "Market conditions look constructive heading into today's session. Momentum is on the side of the bulls — trend intact, volatility contained, no major macro pressure.",
+            "NEUTRAL": "The market is sending mixed signals today. Focus on your highest-conviction ideas only and keep position sizing in check.",
+            "CAUTION": "Conditions have shifted to cautious today. Hold existing positions and resist the urge to add until the market shows stabilization.",
+            "BEAR":    "This is a risk-off day. Multiple signals are flashing red. Capital preservation takes priority."
         }
         verdict_text = ai_verdict if ai_verdict else fallback_verdict.get(ms["cond"], "")
+
+        # Record this verdict in memory
+        sp_chg = ms["sp500"]["chg"] if ms["sp500"] else 0
+        record_daily_verdict(ms["cond"], ms["score"], sp_chg, verdict_text[:200])
+
         verdict_html = (f'<div style="background:{ms["c_bg"]};border-left:4px solid {ms["c_color"]};'
                         f'border-radius:0 8px 8px 0;padding:16px 18px;font-size:14px;color:#1a1a1a;line-height:1.8;">'
                         f'{verdict_text}</div>')
@@ -754,15 +1001,14 @@ async def send_morning_email():
         )
 
         signals_html = "".join(
-            f'<div style="padding:6px 0;border-bottom:1px solid #f5f5f5;font-size:13px;color:#333;">'
-            f'<span style="margin-right:8px;">{icon}</span>{text}</div>'
+            f'<div style="padding:6px 0;border-bottom:1px solid #f5f5f5;font-size:13px;color:#333;"><span style="margin-right:8px;">{icon}</span>{text}</div>'
             for icon, text in ms["flags"]
         )
 
         fg_html = ""
         if fg:
             fgc = fg_color(fg["score"])
-            fg_html = (f'<div style="display:flex;align-items:center;gap:16px;background:#f8f8f8;border-radius:8px;padding:14px 16px;margin-bottom:10px;">'
+            fg_html = (f'<div style="display:flex;align-items:center;gap:16px;background:#f8f8f8;border-radius:8px;padding:14px 16px;">'
                        f'<div style="font-size:32px;font-weight:800;color:{fgc};">{fg_emoji(fg["score"])} {int(fg["score"])}</div>'
                        f'<div style="font-size:13px;color:#333;line-height:1.6;">{fg_plain_english(fg["score"], fg["rating"])}</div></div>')
 
@@ -770,10 +1016,7 @@ async def send_morning_email():
         treasury_html = f'<div style="font-size:13px;color:#333;line-height:1.8;margin-bottom:10px;">{treasury_text}</div>'
         if yields:
             yield_pills = "".join(
-                f'<span style="display:inline-block;background:#f0f0f0;border-radius:4px;padding:4px 10px;'
-                f'font-size:12px;font-family:monospace;margin:3px 4px 3px 0;'
-                f'color:{"#b83232" if v >= TREASURY_ALERT_THRESHOLD else "#333"};">'
-                f'{k.upper()} {v:.2f}%</span>'
+                f'<span style="display:inline-block;background:#f0f0f0;border-radius:4px;padding:4px 10px;font-size:12px;font-family:monospace;margin:3px 4px 3px 0;color:{"#b83232" if v >= TREASURY_ALERT_THRESHOLD else "#333"};">{k.upper()} {v:.2f}%</span>'
                 for k, v in yields.items()
             )
             treasury_html += f'<div style="margin-top:6px;">{yield_pills}</div>'
@@ -786,10 +1029,8 @@ async def send_morning_email():
                 sc     = "#1a7a4a" if price <= item["target"] else "#888"
                 status = "🟢 In buy zone" if price <= item["target"] else f"${abs(diff):.2f} above target"
                 watchlist_html += (f'<div style="display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid #f5f5f5;font-size:13px;">'
-                                   f'<span style="font-weight:600;">{item["ticker"]}</span>'
-                                   f'<span style="color:#555;">${price:,.2f}</span>'
-                                   f'<span style="color:#aaa;">Target ${item["target"]}</span>'
-                                   f'<span style="color:{sc};">{status}</span></div>')
+                                   f'<span style="font-weight:600;">{item["ticker"]}</span><span style="color:#555;">${price:,.2f}</span>'
+                                   f'<span style="color:#aaa;">Target ${item["target"]}</span><span style="color:{sc};">{status}</span></div>')
 
         upcoming = get_upcoming_earnings(days_ahead=5)
         earnings_html = ""
@@ -797,8 +1038,7 @@ async def send_morning_email():
             for e in upcoming:
                 days_label = "Today" if e["days"] == 0 else ("Tomorrow" if e["days"] == 1 else f"In {e['days']} days")
                 earnings_html += (f'<div style="display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid #f5f5f5;font-size:13px;">'
-                                  f'<span style="font-weight:600;">{e["ticker"]}</span>'
-                                  f'<span style="color:#555;">{e["date"]}</span>'
+                                  f'<span style="font-weight:600;">{e["ticker"]}</span><span style="color:#555;">{e["date"]}</span>'
                                   f'<span style="color:#e8a030;">{days_label}</span></div>')
         else:
             earnings_html = '<div style="font-size:13px;color:#999;">No earnings from your holdings this week.</div>'
@@ -829,8 +1069,7 @@ async def send_morning_email():
         )
 
         await send_email(f"{ms['c_emoji']} Market Outlook — {ms['cond']} · {date_short}", wrap_email(rows))
-        logger.info(f"Morning email sent — {ms['cond']} {'(AI verdict)' if ai_verdict else '(fallback verdict)'}")
-
+        logger.info(f"Morning email sent — {ms['cond']} {'(AI)' if ai_verdict else '(fallback)'}")
         await send_morning_brief_telegram(ms)
 
 # ─── TELEGRAM MORNING BRIEF ───────────────────────────────────────────────────
@@ -851,190 +1090,7 @@ async def send_morning_brief_telegram(ms=None):
         await send_sleeper_pick(session)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ─── CONSIDER BUYING SCANNER ──────────────────────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
-CONSIDER_BUYING_UNIVERSE = [
-    {"ticker": "PANW",  "name": "Palo Alto Networks",  "sector": "Cybersecurity"},
-    {"ticker": "WYNN",  "name": "Wynn Resorts",         "sector": "Casino/Hospitality"},
-    {"ticker": "CRWD",  "name": "CrowdStrike",          "sector": "Cybersecurity"},
-    {"ticker": "AMZN",  "name": "Amazon",               "sector": "E-commerce/Cloud"},
-    {"ticker": "GWRE",  "name": "Guidewire Software",   "sector": "InsurTech"},
-    {"ticker": "SOFI",  "name": "SoFi Technologies",    "sector": "Fintech"},
-    {"ticker": "RKLB",  "name": "Rocket Lab USA",       "sector": "Space"},
-    {"ticker": "PLTR",  "name": "Palantir",             "sector": "AI/Analytics"},
-    {"ticker": "COIN",  "name": "Coinbase",             "sector": "Crypto Exchange"},
-    {"ticker": "NET",   "name": "Cloudflare",           "sector": "Cloud Security"},
-    {"ticker": "SHOP",  "name": "Shopify",              "sector": "E-commerce"},
-    {"ticker": "TTD",   "name": "The Trade Desk",       "sector": "AdTech"},
-    {"ticker": "DDOG",  "name": "Datadog",              "sector": "Cloud Monitoring"},
-    {"ticker": "UBER",  "name": "Uber",                 "sector": "Mobility"},
-    {"ticker": "GD",    "name": "General Dynamics",     "sector": "Defense"},
-]
-
-async def run_consider_buying_scan():
-    """Scan universe for high-conviction buying setups, send AI-powered alert."""
-    global consider_buying_fired_today
-    today = datetime.now(EST).date()
-    logger.info("Running Consider Buying scan...")
-
-    async with aiohttp.ClientSession() as session:
-        for stock in CONSIDER_BUYING_UNIVERSE:
-            ticker = stock["ticker"]
-            key    = f"{ticker}_{today}"
-            if key in consider_buying_fired_today:
-                continue
-
-            try:
-                prices = await get_historical_prices(session, ticker, days=90)
-                if not prices or len(prices) < 30:
-                    continue
-
-                current  = prices[-1]
-                high_52w = max(prices)
-                drawdown = ((high_52w - current) / high_52w) * 100
-                rsi      = calc_rsi(prices, 14)
-                sma20    = calc_sma(prices, MA_SHORT)
-                sma50    = calc_sma(prices, MA_LONG)
-                macd, macd_sig, macd_hist = calc_macd(prices)
-
-                if not rsi or not sma20 or not sma50:
-                    continue
-
-                # Scoring — needs multiple signals to fire
-                conviction_score = 0
-                if rsi <= 35:          conviction_score += 3
-                elif rsi <= 45:        conviction_score += 1
-                if drawdown >= 25:     conviction_score += 2
-                elif drawdown >= 15:   conviction_score += 1
-                if current > sma20:    conviction_score += 1
-                if macd and macd_sig and macd > macd_sig: conviction_score += 1
-
-                # Only fire on strong setups (score >= 4)
-                if conviction_score < 4:
-                    continue
-
-                # Get recent news
-                articles = await get_news(session, ticker, max_articles=3)
-                headlines = [a["title"] for a in articles]
-
-                # MACD signal description
-                if macd and macd_sig:
-                    if macd > macd_sig:   macd_desc = "bullish crossover"
-                    elif macd < macd_sig: macd_desc = "bearish — caution"
-                    else:                 macd_desc = "neutral"
-                else:
-                    macd_desc = "insufficient data"
-
-                # Get AI conviction alert
-                ai_alert = await get_ai_consider_buying(
-                    ticker=ticker, name=stock["name"], sector=stock["sector"],
-                    price=current, rsi=rsi, drawdown=drawdown,
-                    sma20=sma20, sma50=sma50, macd_signal=macd_desc,
-                    news_headlines=headlines
-                )
-
-                if not ai_alert:
-                    continue
-
-                # Extract conviction level from AI response
-                conviction_level = "MEDIUM"
-                if "HIGH" in ai_alert.upper().split()[-10:]:   conviction_level = "HIGH"
-                elif "LOW" in ai_alert.upper().split()[-10:]:  conviction_level = "LOW"
-
-                conviction_emoji = {"HIGH": "🔥", "MEDIUM": "🟡", "LOW": "⚪"}.get(conviction_level, "🟡")
-
-                # Send Telegram alert
-                msg = (
-                    f"💡 *CONSIDER BUYING — {stock['name']}* ({ticker})\n"
-                    f"─────────────────────────\n"
-                    f"🏷 {stock['sector']} · ${current:,.2f}\n"
-                    f"📉 Down {drawdown:.1f}% from 52w high · RSI {rsi}\n"
-                    f"─────────────────────────\n"
-                    f"{ai_alert}\n"
-                    f"─────────────────────────\n"
-                    f"{conviction_emoji} Conviction: *{conviction_level}*\n"
-                    f"⚡ _Not financial advice_"
-                )
-                await send_message(msg)
-                consider_buying_fired_today.add(key)
-                logger.info(f"Consider Buying fired: {ticker} — {conviction_level}")
-                await asyncio.sleep(2)
-
-            except Exception as e:
-                logger.error(f"Consider Buying scan error {ticker}: {e}")
-            await asyncio.sleep(0.5)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ─── WHY DID THIS MOVE CHECKER ────────────────────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
-async def check_why_did_this_move():
-    """Detect 3%+ intraday moves and explain them via AI."""
-    async with aiohttp.ClientSession() as session:
-        sp500 = await fetch_index(session, "^GSPC")
-        market_chg = sp500["chg"] if sp500 else 0
-
-        for ticker, info in HOLDINGS.items():
-            if ticker in CRYPTO_MAP:
-                continue
-            try:
-                price = await get_stock_price(session, ticker)
-                prev  = await get_prev_close(session, ticker)
-                if not price or not prev:
-                    continue
-
-                move_pct = ((price - prev) / prev) * 100
-
-                # Only trigger on 3%+ moves
-                if abs(move_pct) < 3.0:
-                    intraday_prices[ticker] = price
-                    continue
-
-                # Check if we already fired for this ticker today
-                alert_key = f"move_{ticker}_{datetime.now(EST).date()}"
-                if fired_alerts.get(alert_key):
-                    continue
-
-                # Check if this move is significantly more than the market
-                excess_move = abs(move_pct) - abs(market_chg)
-                if excess_move < 1.5:  # If it's just moving with market, skip
-                    continue
-
-                fired_alerts[alert_key] = datetime.now()
-
-                # Get news for context
-                articles = await get_news(session, ticker, max_articles=3)
-                headlines = [a["title"] for a in articles]
-
-                # Get AI explanation
-                explanation = await get_ai_move_explanation(
-                    ticker=ticker, name=info["name"],
-                    move_pct=move_pct, direction="up" if move_pct > 0 else "down",
-                    news_headlines=headlines, market_chg=market_chg
-                )
-
-                if not explanation:
-                    explanation = f"No specific catalyst found — may be moving with broader sector trends or on low volume."
-
-                direction_emoji = "📈" if move_pct > 0 else "📉"
-                msg = (
-                    f"{direction_emoji} *WHY IS {ticker} MOVING?*\n"
-                    f"─────────────────────\n"
-                    f"*{info['name']}* is {'+' if move_pct > 0 else ''}{move_pct:.1f}% today\n"
-                    f"Market (S&P): {'+' if market_chg > 0 else ''}{market_chg:.2f}%\n"
-                    f"─────────────────────\n"
-                    f"{explanation}\n"
-                    f"─────────────────────\n"
-                    f"⚡ _AI-powered · Not financial advice_"
-                )
-                await send_message(msg)
-                logger.info(f"Why did this move fired: {ticker} {move_pct:+.1f}%")
-
-            except Exception as e:
-                logger.error(f"Move check error {ticker}: {e}")
-            await asyncio.sleep(0.3)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ─── EVENING EMAIL ────────────────────────────────────────────────────────────
+# ─── EVENING EMAIL — with AI wrap + conviction scores ─────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════════
 async def send_evening_email():
     logger.info("Sending evening wrap email...")
@@ -1043,8 +1099,12 @@ async def send_evening_email():
         ms     = await get_market_score(session)
         yields = await get_treasury_yields()
 
-        tomorrow    = datetime.now(EST) + timedelta(days=1)
-        tom_str     = tomorrow.strftime("%A, %B %d")
+        # Update yesterday's memory outcome
+        sp_chg = ms["sp500"]["chg"] if ms["sp500"] else 0
+        update_yesterday_outcome(sp_chg)
+
+        tomorrow     = datetime.now(EST) + timedelta(days=1)
+        tom_str      = tomorrow.strftime("%A, %B %d")
         tom_earnings = [e for e in get_upcoming_earnings(days_ahead=3) if e["days"] <= 2]
 
         govt_events = [
@@ -1057,13 +1117,37 @@ async def send_evening_email():
         date_str   = datetime.now(EST).strftime("%A, %B %d, %Y")
         date_short = datetime.now(EST).strftime("%a %b %d")
 
-        sp_chg = ms["sp500"]["chg"] if ms["sp500"] else 0
-        if sp_chg >= 1.0:   day_wrap = f"A solid session — the S&P finished up {sp_chg:.2f}%, with broad participation. The bulls maintained control throughout the day."
-        elif sp_chg >= 0:   day_wrap = f"A quiet, slightly positive session. The S&P edged up {sp_chg:.2f}% — nothing dramatic but the path of least resistance remains upward."
-        elif sp_chg >= -1.0: day_wrap = f"A modestly negative day — the S&P slipped {abs(sp_chg):.2f}%. Nothing alarming, but the market gave back some ground without a clear catalyst."
-        else:               day_wrap = f"A rough session — the S&P sold off {abs(sp_chg):.2f}%. Broad weakness with few places to hide. Worth monitoring overnight sentiment."
+        # ── AI EVENING WRAP ──
+        ai_wrap = await get_ai_evening_wrap(ms, prices_data, total_value, daily_news_cache[:10])
+        if ai_wrap:
+            # Split into two paragraphs for display
+            paragraphs = ai_wrap.split("\n\n")
+            if len(paragraphs) >= 2:
+                day_review_html = (
+                    f'<div style="font-size:14px;color:#333;line-height:1.8;margin-bottom:12px;">{paragraphs[0]}</div>'
+                    f'<div style="font-size:14px;color:#555;line-height:1.8;background:#f8f8f8;border-radius:8px;padding:14px 16px;border-left:3px solid #e8a030;">'
+                    f'<div style="font-size:10px;font-family:monospace;color:#aaa;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:6px;">What to watch tomorrow</div>'
+                    f'{paragraphs[1]}</div>'
+                    f'<div style="font-size:11px;color:#bbb;margin-top:6px;font-family:monospace;">✦ AI-generated wrap</div>'
+                )
+            else:
+                day_review_html = f'<div style="font-size:14px;color:#333;line-height:1.8;">{ai_wrap}</div><div style="font-size:11px;color:#bbb;margin-top:6px;font-family:monospace;">✦ AI-generated wrap</div>'
+        else:
+            # Fallback
+            if sp_chg >= 1.0:   fallback = f"A solid session — the S&P finished up {sp_chg:.2f}%, bulls maintained control throughout the day."
+            elif sp_chg >= 0:   fallback = f"A quiet, slightly positive session. The S&P edged up {sp_chg:.2f}% — path of least resistance remains upward."
+            elif sp_chg >= -1.0: fallback = f"A modestly negative day — the S&P slipped {abs(sp_chg):.2f}%. Nothing alarming, market gave back some ground."
+            else:               fallback = f"A rough session — the S&P sold off {abs(sp_chg):.2f}%. Worth monitoring overnight sentiment."
+            day_review_html = f'<div style="font-size:14px;color:#333;line-height:1.8;">{fallback}</div>'
 
-        tom_html = f'<div style="font-size:13px;color:#333;line-height:1.8;margin-bottom:12px;">Here\'s what\'s on the radar for <strong>{tom_str}</strong>:</div>'
+        # ── CONVICTION SCORES ──
+        conv_scores = await get_ai_conviction_scores(prices_data, ms)
+        if conv_scores:
+            save_conviction_scores(conv_scores)
+        conv_html = conviction_scores_html(conv_scores)
+
+        # Tomorrow section
+        tom_html = f'<div style="font-size:13px;color:#333;line-height:1.8;margin-bottom:12px;">On the radar for <strong>{tom_str}</strong>:</div>'
         if tom_earnings:
             tom_html += '<div style="font-size:12px;font-weight:600;color:#e8a030;margin-bottom:6px;">EARNINGS</div>'
             for e in tom_earnings:
@@ -1071,7 +1155,7 @@ async def send_evening_email():
                 tom_html += (f'<div style="padding:6px 0;border-bottom:1px solid #f5f5f5;font-size:13px;display:flex;justify-content:space-between;">'
                              f'<span style="font-weight:600;">{e["ticker"]}</span><span style="color:#888;">{e["date"]}</span>'
                              f'<span style="color:#e8a030;">{label}</span></div>')
-        tom_html += '<div style="font-size:12px;font-weight:600;color:#888;margin:12px 0 6px;">ECONOMIC DATA THIS WEEK</div>'
+        tom_html += '<div style="font-size:12px;font-weight:600;color:#888;margin:12px 0 6px;">ECONOMIC DATA</div>'
         for event in govt_events[:3]:
             tom_html += (f'<div style="padding:5px 0;border-bottom:1px solid #f5f5f5;font-size:13px;display:flex;justify-content:space-between;">'
                          f'<span style="color:#555;">{event["date"]}</span><span style="color:#333;">{event["event"]}</span></div>')
@@ -1089,21 +1173,22 @@ async def send_evening_email():
 
         rows = (
             email_header("📊 Evening Market Wrap", f"{date_str} · 5:00pm EST") +
-            email_section("Day in Review", f'<div style="font-size:14px;color:#333;line-height:1.8;">{day_wrap}</div>') +
+            email_section("Day in Review", day_review_html) +
             email_section("Closing Indices", index_table_html(ms)) +
             email_section("Your Portfolio — Close", portfolio_table_html(prices_data)) +
+            email_section("Conviction Scores — All Holdings", conv_html) +
             email_section("Goal Progress", goal_bar_html(total_value)) +
             email_section("Watchlist Check", watchlist_html or '<div style="color:#999;font-size:13px;">No items on watchlist.</div>') +
             email_section("Today's News", news_html_block(daily_news_cache, max_items=5)) +
-            email_section("Looking Ahead — Tomorrow & This Week", tom_html) +
+            email_section("Looking Ahead", tom_html) +
             email_footer()
         )
         await send_email(f"📊 Evening Wrap — {date_short}", wrap_email(rows))
         daily_news_cache.clear()
-        logger.info("Evening email sent")
+        logger.info(f"Evening email sent {'(AI wrap)' if ai_wrap else '(fallback wrap)'}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ─── MONDAY EMAIL ─────────────────────────────────────────────────────────────
+# ─── MONDAY EMAIL — with portfolio coaching ───────────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════════
 async def send_monday_email():
     logger.info("Sending Monday week ahead email...")
@@ -1118,11 +1203,19 @@ async def send_monday_email():
 
         score = ms["score"]
         if score >= 3:
-            weekly_outlook = "The week is setting up constructively. Momentum heading into Monday is positive and the macro backdrop isn't throwing up major red flags. This is a week where staying patient on your watchlist names could pay off — be ready to act if entries line up."
+            weekly_outlook = "The week is setting up constructively. Momentum heading into Monday is positive and the macro backdrop isn't throwing up major red flags. This is a week where staying patient on your watchlist names could pay off."
         elif score >= 0:
-            weekly_outlook = "The week ahead looks mixed. There's no clear catalyst driving the market strongly in either direction, which means discipline matters more than ever. Stick to your plan, focus on names where the setup is clear, and don't let FOMO push you into marginal trades."
+            weekly_outlook = "The week ahead looks mixed. Discipline matters more than ever — stick to your plan, focus on names where the setup is clear, and don't let FOMO push you into marginal trades."
         else:
-            weekly_outlook = "Heading into this week with some caution warranted. The weight of the signals suggests the market needs to prove itself before adding new risk. Keep your watchlist ready but let price action confirm before committing capital."
+            weekly_outlook = "Heading into this week with some caution warranted. Let price action confirm before committing capital. Keep your watchlist ready but don't force entries."
+
+        # ── AI PORTFOLIO COACHING ──
+        ai_coaching = await get_ai_portfolio_coaching(prices_data, total_value, ms, period="monday")
+        coaching_html = (
+            f'<div style="background:#f8f8f8;border-left:4px solid #e8a030;border-radius:0 8px 8px 0;padding:16px 18px;font-size:14px;color:#1a1a1a;line-height:1.8;">'
+            f'{ai_coaching}</div>'
+            f'<div style="font-size:11px;color:#bbb;margin-top:6px;font-family:monospace;">✦ AI portfolio coach</div>'
+        ) if ai_coaching else '<div style="color:#999;font-size:13px;">Portfolio coaching unavailable today.</div>'
 
         indicators_html = ""
         if ms["sp500"] and len(ms["sp500"]["closes"]) >= 50:
@@ -1135,11 +1228,11 @@ async def send_monday_email():
                 f'<div style="background:#f8f8f8;border-radius:8px;padding:12px;text-align:center;">'
                 f'<div style="font-size:10px;color:#999;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:4px;">S&P SMA20</div>'
                 f'<div style="font-size:16px;font-weight:600;color:{"#1a7a4a" if ms["sp500"]["price"] > sma20 else "#b83232"};">${sma20:,.0f}</div>'
-                f'<div style="font-size:11px;color:#999;">{"Price above ✅" if ms["sp500"]["price"] > sma20 else "Price below ⚠️"}</div></div>'
+                f'<div style="font-size:11px;color:#999;">{"Above ✅" if ms["sp500"]["price"] > sma20 else "Below ⚠️"}</div></div>'
                 f'<div style="background:#f8f8f8;border-radius:8px;padding:12px;text-align:center;">'
                 f'<div style="font-size:10px;color:#999;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:4px;">S&P SMA50</div>'
                 f'<div style="font-size:16px;font-weight:600;color:{"#1a7a4a" if ms["sp500"]["price"] > sma50 else "#b83232"};">${sma50:,.0f}</div>'
-                f'<div style="font-size:11px;color:#999;">{"Price above ✅" if ms["sp500"]["price"] > sma50 else "Price below ⚠️"}</div></div>'
+                f'<div style="font-size:11px;color:#999;">{"Above ✅" if ms["sp500"]["price"] > sma50 else "Below ⚠️"}</div></div>'
                 f'<div style="background:#f8f8f8;border-radius:8px;padding:12px;text-align:center;">'
                 f'<div style="font-size:10px;color:#999;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:4px;">S&P RSI (14)</div>'
                 f'<div style="font-size:16px;font-weight:600;color:{"#b83232" if rsi_val and rsi_val >= 70 else "#1a7a4a" if rsi_val and rsi_val <= 30 else "#333"};">{rsi_val if rsi_val else "—"}</div>'
@@ -1184,6 +1277,7 @@ async def send_monday_email():
             f'<div style="font-size:12px;font-family:monospace;letter-spacing:0.1em;color:{ms["c_color"]};text-transform:uppercase;margin-bottom:4px;">Market Condition Heading In</div>'
             f'<div style="font-size:24px;font-weight:800;color:{ms["c_color"]};">{ms["c_emoji"]} {ms["cond"]}</div></td></tr>' +
             email_section("Weekly Outlook", f'<div style="font-size:14px;color:#333;line-height:1.8;">{weekly_outlook}</div>') +
+            email_section("Portfolio Coaching", coaching_html) +
             email_section("Market Indicators Deep Dive", indicators_html) +
             email_section("Indices Snapshot", index_table_html(ms)) +
             email_section("Earnings This Week", earnings_html) +
@@ -1193,10 +1287,10 @@ async def send_monday_email():
             email_footer("Have a great week")
         )
         await send_email(f"📅 Week Ahead — {date_short}", wrap_email(rows))
-        logger.info("Monday email sent")
+        logger.info(f"Monday email sent {'(AI coaching)' if ai_coaching else '(no coaching)'}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ─── FRIDAY EMAIL ─────────────────────────────────────────────────────────────
+# ─── FRIDAY EMAIL — with portfolio coaching + memory accuracy ─────────────────
 # ═══════════════════════════════════════════════════════════════════════════════
 async def send_friday_email():
     logger.info("Sending Friday week recap email...")
@@ -1218,10 +1312,10 @@ async def send_friday_email():
             if pl_pct < worst["pct"]: worst = {"ticker": ticker, "pct": pl_pct, "price": price, "name": info["name"]}
 
         sp_chg = ms["sp500"]["chg"] if ms["sp500"] else 0
-        if sp_chg >= 1.5:   week_recap = f"Strong finish to the week — the S&P wrapped up with a {sp_chg:.2f}% gain on the day. Momentum is heading into the weekend on solid footing."
-        elif sp_chg >= 0:   week_recap = f"The market closed quietly positive on Friday, up {sp_chg:.2f}%. A steady, uneventful week."
-        elif sp_chg >= -1.0: week_recap = f"A soft close to the week — the S&P dipped {abs(sp_chg):.2f}% on Friday. Markets heading into the weekend with some unresolved questions."
-        else:               week_recap = f"A rough end to the week. The S&P sold off {abs(sp_chg):.2f}% on Friday. Use the weekend to reassess positions with fresh eyes."
+        if sp_chg >= 1.5:    week_recap = f"Strong finish to the week — the S&P wrapped up with a {sp_chg:.2f}% gain. Momentum heading into the weekend on solid footing."
+        elif sp_chg >= 0:    week_recap = f"The market closed quietly positive on Friday, up {sp_chg:.2f}%. A steady, uneventful week."
+        elif sp_chg >= -1.0: week_recap = f"A soft close to the week — the S&P dipped {abs(sp_chg):.2f}%. Markets heading into the weekend with some unresolved questions."
+        else:                week_recap = f"A rough end to the week. The S&P sold off {abs(sp_chg):.2f}% on Friday. Use the weekend to reassess positions with fresh eyes."
 
         perf_html = ""
         if best["ticker"]:
@@ -1234,6 +1328,41 @@ async def send_friday_email():
                           f'<div style="font-size:11px;color:#b83232;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:3px;">Most Pressure</div>'
                           f'<div style="font-size:15px;font-weight:600;color:#b83232;">{worst["ticker"]} — {worst["pct"]:+.1f}% total return · ${worst["price"]:,.2f}</div>'
                           f'<div style="font-size:12px;color:#888;margin-top:2px;">{worst["name"]}</div></div>')
+
+        # ── AI PORTFOLIO COACHING ──
+        ai_coaching = await get_ai_portfolio_coaching(prices_data, total_value, ms, period="friday")
+        coaching_html = (
+            f'<div style="background:#f8f8f8;border-left:4px solid #e8a030;border-radius:0 8px 8px 0;padding:16px 18px;font-size:14px;color:#1a1a1a;line-height:1.8;">'
+            f'{ai_coaching}</div>'
+            f'<div style="font-size:11px;color:#bbb;margin-top:6px;font-family:monospace;">✦ AI portfolio coach</div>'
+        ) if ai_coaching else ""
+
+        # ── MARKET MEMORY ACCURACY ──
+        memory = load_memory()
+        completed = [d for d in memory.get("daily", []) if d.get("outcome") is not None]
+        memory_html = ""
+        if completed:
+            correct_count = sum(1 for d in completed if d.get("correct"))
+            accuracy = (correct_count / len(completed)) * 100
+            recent_5 = completed[-5:]
+            memory_html = (
+                f'<div style="display:flex;align-items:center;gap:16px;background:#f8f8f8;border-radius:8px;padding:14px 16px;margin-bottom:12px;">'
+                f'<div style="text-align:center;">'
+                f'<div style="font-size:28px;font-weight:800;color:{"#1a7a4a" if accuracy >= 60 else "#b83232"};">{accuracy:.0f}%</div>'
+                f'<div style="font-size:11px;color:#999;margin-top:2px;">accuracy</div></div>'
+                f'<div><div style="font-size:13px;font-weight:500;color:#333;margin-bottom:4px;">{correct_count}/{len(completed)} calls correct this week</div>'
+                f'<div style="font-size:12px;color:#666;line-height:1.6;">{"Market is tracking our predictions well." if accuracy >= 60 else "Conditions have been unpredictable — staying flexible matters."}</div>'
+                f'</div></div>'
+            )
+            # Recent history pills
+            memory_html += '<div style="display:flex;gap:6px;flex-wrap:wrap;">'
+            for entry in recent_5:
+                if entry.get("correct") is not None:
+                    pill_color = "#f0fff4" if entry["correct"] else "#fff0f0"
+                    text_color = "#166534" if entry["correct"] else "#b83232"
+                    check      = "✓" if entry["correct"] else "✗"
+                    memory_html += f'<span style="background:{pill_color};color:{text_color};font-size:11px;padding:3px 9px;border-radius:4px;font-family:monospace;">{check} {entry["date"]} {entry["condition"]}</span>'
+            memory_html += '</div>'
 
         weekend_reads = await get_news(session, "investing economy market outlook weekend", max_articles=4)
         reads_html = news_html_block([{**a, "ticker": ""} for a in weekend_reads], max_items=4)
@@ -1270,13 +1399,132 @@ async def send_friday_email():
             email_section("Closing Indices", index_table_html(ms)) +
             email_section("Portfolio Performance", perf_html + "<br>" + portfolio_table_html(prices_data)) +
             email_section("Goal Progress", goal_bar_html(total_value)) +
+            (email_section("Portfolio Coaching", coaching_html) if ai_coaching else "") +
+            (email_section("Bot Accuracy This Week", memory_html) if memory_html else "") +
             email_section("Notes & Suggestions", notes_html) +
             email_section("Weekend Reading", reads_html) +
             email_section("Looking Ahead to Next Week", next_html) +
             email_footer("Have a great weekend Patrick")
         )
         await send_email(f"📋 Week in Review — {date_short}", wrap_email(rows))
-        logger.info("Friday email sent")
+        logger.info(f"Friday email sent {'(AI coaching)' if ai_coaching else ''}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ─── CONSIDER BUYING SCANNER ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+CONSIDER_BUYING_UNIVERSE = [
+    {"ticker": "PANW",  "name": "Palo Alto Networks",  "sector": "Cybersecurity"},
+    {"ticker": "WYNN",  "name": "Wynn Resorts",         "sector": "Casino/Hospitality"},
+    {"ticker": "CRWD",  "name": "CrowdStrike",          "sector": "Cybersecurity"},
+    {"ticker": "AMZN",  "name": "Amazon",               "sector": "E-commerce/Cloud"},
+    {"ticker": "GWRE",  "name": "Guidewire Software",   "sector": "InsurTech"},
+    {"ticker": "SOFI",  "name": "SoFi Technologies",    "sector": "Fintech"},
+    {"ticker": "RKLB",  "name": "Rocket Lab USA",       "sector": "Space"},
+    {"ticker": "PLTR",  "name": "Palantir",             "sector": "AI/Analytics"},
+    {"ticker": "COIN",  "name": "Coinbase",             "sector": "Crypto Exchange"},
+    {"ticker": "NET",   "name": "Cloudflare",           "sector": "Cloud Security"},
+    {"ticker": "SHOP",  "name": "Shopify",              "sector": "E-commerce"},
+    {"ticker": "TTD",   "name": "The Trade Desk",       "sector": "AdTech"},
+    {"ticker": "DDOG",  "name": "Datadog",              "sector": "Cloud Monitoring"},
+    {"ticker": "UBER",  "name": "Uber",                 "sector": "Mobility"},
+    {"ticker": "GD",    "name": "General Dynamics",     "sector": "Defense"},
+]
+
+async def run_consider_buying_scan():
+    global consider_buying_fired_today
+    today = datetime.now(EST).date()
+    logger.info("Running Consider Buying scan...")
+    async with aiohttp.ClientSession() as session:
+        for stock in CONSIDER_BUYING_UNIVERSE:
+            ticker = stock["ticker"]
+            key    = f"{ticker}_{today}"
+            if key in consider_buying_fired_today: continue
+            try:
+                prices = await get_historical_prices(session, ticker, days=90)
+                if not prices or len(prices) < 30: continue
+                current  = prices[-1]; high_52w = max(prices)
+                drawdown = ((high_52w - current) / high_52w) * 100
+                rsi      = calc_rsi(prices, 14)
+                sma20    = calc_sma(prices, MA_SHORT)
+                sma50    = calc_sma(prices, MA_LONG)
+                macd, macd_sig, macd_hist = calc_macd(prices)
+                if not rsi or not sma20 or not sma50: continue
+                conviction_score = 0
+                if rsi <= 35:       conviction_score += 3
+                elif rsi <= 45:     conviction_score += 1
+                if drawdown >= 25:  conviction_score += 2
+                elif drawdown >= 15: conviction_score += 1
+                if current > sma20: conviction_score += 1
+                if macd and macd_sig and macd > macd_sig: conviction_score += 1
+                if conviction_score < 4: continue
+                articles  = await get_news(session, ticker, max_articles=3)
+                headlines = [a["title"] for a in articles]
+                if macd and macd_sig:
+                    macd_desc = "bullish crossover" if macd > macd_sig else "bearish — caution"
+                else:
+                    macd_desc = "insufficient data"
+                ai_alert = await get_ai_consider_buying(
+                    ticker=ticker, name=stock["name"], sector=stock["sector"],
+                    price=current, rsi=rsi, drawdown=drawdown,
+                    sma20=sma20, sma50=sma50, macd_signal=macd_desc, news_headlines=headlines
+                )
+                if not ai_alert: continue
+                conviction_level = "MEDIUM"
+                if "HIGH" in ai_alert.upper().split()[-10:]:   conviction_level = "HIGH"
+                elif "LOW" in ai_alert.upper().split()[-10:]:  conviction_level = "LOW"
+                conviction_emoji = {"HIGH": "🔥", "MEDIUM": "🟡", "LOW": "⚪"}.get(conviction_level, "🟡")
+                await send_message(
+                    f"💡 *CONSIDER BUYING — {stock['name']}* ({ticker})\n─────────────────────────\n"
+                    f"🏷 {stock['sector']} · ${current:,.2f}\n"
+                    f"📉 Down {drawdown:.1f}% from 52w high · RSI {rsi}\n─────────────────────────\n"
+                    f"{ai_alert}\n─────────────────────────\n"
+                    f"{conviction_emoji} Conviction: *{conviction_level}*\n⚡ _Not financial advice_"
+                )
+                consider_buying_fired_today.add(key)
+                await asyncio.sleep(2)
+            except Exception as e:
+                logger.error(f"Consider Buying scan error {ticker}: {e}")
+            await asyncio.sleep(0.5)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ─── WHY DID THIS MOVE ────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+async def check_why_did_this_move():
+    async with aiohttp.ClientSession() as session:
+        sp500 = await fetch_index(session, "^GSPC")
+        market_chg = sp500["chg"] if sp500 else 0
+        for ticker, info in HOLDINGS.items():
+            if ticker in CRYPTO_MAP: continue
+            try:
+                price = await get_stock_price(session, ticker)
+                prev  = await get_prev_close(session, ticker)
+                if not price or not prev: continue
+                move_pct = ((price - prev) / prev) * 100
+                if abs(move_pct) < 3.0: continue
+                alert_key = f"move_{ticker}_{datetime.now(EST).date()}"
+                if fired_alerts.get(alert_key): continue
+                excess_move = abs(move_pct) - abs(market_chg)
+                if excess_move < 1.5: continue
+                fired_alerts[alert_key] = datetime.now()
+                articles    = await get_news(session, ticker, max_articles=3)
+                headlines   = [a["title"] for a in articles]
+                explanation = await get_ai_move_explanation(
+                    ticker=ticker, name=info["name"], move_pct=move_pct,
+                    direction="up" if move_pct > 0 else "down",
+                    news_headlines=headlines, market_chg=market_chg
+                )
+                if not explanation:
+                    explanation = "No specific catalyst found — may be moving with broader sector trends or on low volume."
+                direction_emoji = "📈" if move_pct > 0 else "📉"
+                await send_message(
+                    f"{direction_emoji} *WHY IS {ticker} MOVING?*\n─────────────────────\n"
+                    f"*{info['name']}* is {'+' if move_pct > 0 else ''}{move_pct:.1f}% today\n"
+                    f"Market (S&P): {'+' if market_chg > 0 else ''}{market_chg:.2f}%\n─────────────────────\n"
+                    f"{explanation}\n─────────────────────\n⚡ _AI-powered · Not financial advice_"
+                )
+            except Exception as e:
+                logger.error(f"Move check error {ticker}: {e}")
+            await asyncio.sleep(0.3)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ─── SLEEPER SCANNER ──────────────────────────────────────────────────────────
@@ -1303,11 +1551,9 @@ async def send_sleeper_pick(session):
             await asyncio.sleep(0.5)
         except Exception as e:
             logger.error(f"Sleeper scan error {ticker}: {e}")
-
     if not candidates:
         await send_message("🔍 *SLEEPER PICK* — No strong candidates today. Market may be broadly elevated.")
         return
-
     best = sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
     recovery = ((best["high_52w"] - best["price"]) / best["price"]) * 100
     await send_message(
@@ -1371,12 +1617,12 @@ async def check_ma_alerts():
                 key = f"ma_golden_{ticker}"; last = fired_alerts.get(key)
                 if not last or (datetime.now() - last).days >= 1:
                     fired_alerts[key] = datetime.now()
-                    await send_message(f"📈 *GOLDEN CROSS — {ticker}*\n─────────────────────\n✅ SMA20 crossed ABOVE SMA50\n📌 *{HOLDINGS[ticker]['name']}* @ ${cp:,.2f}\nSMA20: ${sma20:,.2f} · SMA50: ${sma50:,.2f}\n─────────────────────\n🟢 *Bullish signal* — trend turning up.")
+                    await send_message(f"📈 *GOLDEN CROSS — {ticker}*\n─────────────────────\n✅ SMA20 crossed ABOVE SMA50\n📌 *{HOLDINGS[ticker]['name']}* @ ${cp:,.2f}\n─────────────────────\n🟢 *Bullish signal* — trend turning up.")
             elif not gn and gp:
                 key = f"ma_death_{ticker}"; last = fired_alerts.get(key)
                 if not last or (datetime.now() - last).days >= 1:
                     fired_alerts[key] = datetime.now()
-                    await send_message(f"📉 *DEATH CROSS — {ticker}*\n─────────────────────\n🔴 SMA20 crossed BELOW SMA50\n📌 *{HOLDINGS[ticker]['name']}* @ ${cp:,.2f}\nSMA20: ${sma20:,.2f} · SMA50: ${sma50:,.2f}\n─────────────────────\n⚠️ *Bearish signal* — consider tightening stops.")
+                    await send_message(f"📉 *DEATH CROSS — {ticker}*\n─────────────────────\n🔴 SMA20 crossed BELOW SMA50\n📌 *{HOLDINGS[ticker]['name']}* @ ${cp:,.2f}\n─────────────────────\n⚠️ *Bearish signal* — consider tightening stops.")
 
 async def check_market_gift():
     global market_gift_fired_today
@@ -1462,7 +1708,6 @@ async def handle_commands():
                         await send_morning_brief_telegram()
 
                     elif cmd == "/ask":
-                        # ── AI-POWERED ASK COMMAND ──
                         if len(parts) >= 2:
                             question = " ".join(parts[1:])
                             await send_message("🤔 Thinking...")
@@ -1481,6 +1726,38 @@ async def handle_commands():
                                 await send_message("⚠️ Couldn't get an answer right now. Try again in a moment.")
                         else:
                             await send_message("⚠️ Usage: /ask should I buy PANW today?")
+
+                    elif cmd == "/scores":
+                        # Show latest conviction scores
+                        memory = load_memory()
+                        if memory.get("conviction_scores"):
+                            latest_date = max(memory["conviction_scores"].keys())
+                            scores = memory["conviction_scores"][latest_date]
+                            lines  = [f"📊 *CONVICTION SCORES* ({latest_date})", "─" * 28]
+                            for ticker, data in scores.items():
+                                score = data["score"]
+                                icon  = "🔥" if score >= 8 else "🟡" if score >= 6 else "🔴"
+                                lines.append(f"{icon} *{ticker}* — {score}/10 · {data['reasoning'][:60]}...")
+                            await send_message("\n".join(lines))
+                        else:
+                            await send_message("⚠️ No conviction scores yet. Check back after tonight's evening email.")
+
+                    elif cmd == "/memory":
+                        # Show market memory accuracy
+                        memory  = load_memory()
+                        daily   = memory.get("daily", [])
+                        completed = [d for d in daily if d.get("outcome") is not None]
+                        if completed:
+                            correct = sum(1 for d in completed if d.get("correct"))
+                            acc = (correct / len(completed)) * 100
+                            lines = [f"🧠 *MARKET MEMORY*", f"Accuracy: {correct}/{len(completed)} calls ({acc:.0f}%)", "─" * 28]
+                            for entry in daily[-7:]:
+                                if entry.get("outcome") is not None:
+                                    check = "✓" if entry.get("correct") else "✗"
+                                    lines.append(f"{check} {entry['date']} — {entry['condition']} | S&P {entry['outcome']:+.2f}%")
+                            await send_message("\n".join(lines))
+                        else:
+                            await send_message("🧠 *MARKET MEMORY* — Building history. Check back after a few days of trading.")
 
                     elif cmd == "/prices":
                         async with aiohttp.ClientSession() as s:
@@ -1551,10 +1828,12 @@ async def handle_commands():
                     elif cmd == "/help":
                         await send_message(
                             "🤖 *COMMANDS*\n─────────────────────\n"
-                            "/ask [question] — Ask the AI anything about your portfolio\n"
+                            "/ask [question] — Ask the AI anything\n"
+                            "/scores — Latest conviction scores per holding\n"
+                            "/memory — Bot's market call accuracy\n"
                             "/brief — Morning brief on demand\n"
                             "/prices — Live prices now\n"
-                            "/watchlist — View watchlist vs targets\n"
+                            "/watchlist — Watchlist vs targets\n"
                             "/addwatch TICKER PRICE — Add to watchlist\n"
                             "/removewatch TICKER — Remove from watchlist\n"
                             "/sleeper — Run sleeper scanner\n"
@@ -1568,80 +1847,68 @@ async def handle_commands():
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════════
 async def main():
-    logger.info("Patrick's Portfolio Bot — Phase B starting...")
-    ai_status = "✅ Claude API connected — AI features active" if ANTHROPIC_API_KEY else "⚠️ Claude API not found — running in standard mode"
+    logger.info("Patrick's Portfolio Bot — Phase B Session 2 starting...")
+    ai_status = "✅ Claude API connected — all AI features active" if ANTHROPIC_API_KEY else "⚠️ Claude API not found — running in standard mode"
     await send_message(
-        f"🤖 *Patrick's Portfolio Bot — Phase B LIVE*\n"
+        f"🤖 *Patrick's Portfolio Bot — Phase B Complete*\n"
         f"─────────────────────\n"
         f"{ai_status}\n"
         f"─────────────────────\n"
-        f"🧠 *New AI Features:*\n"
-        f"  ✦ AI-written morning market verdict\n"
-        f"  ✦ Consider Buying alerts with conviction scoring\n"
-        f"  ✦ /ask command — ask anything about your portfolio\n"
+        f"🧠 *All AI Features Active:*\n"
+        f"  ✦ AI morning market verdict (with memory context)\n"
+        f"  ✦ AI evening wrap — day story + tomorrow preview\n"
+        f"  ✦ Conviction scores — 1-10 per holding nightly\n"
+        f"  ✦ Portfolio coaching — Monday + Friday emails\n"
+        f"  ✦ Market memory — tracks call accuracy over time\n"
+        f"  ✦ Consider Buying alerts with AI conviction\n"
         f"  ✦ Why Did This Move — auto-explains 3%+ moves\n"
+        f"  ✦ /ask — ask anything about your portfolio\n"
         f"─────────────────────\n"
         f"📧 Mon 7:45am · Daily 9:30am · Daily 5pm · Fri 6pm\n"
-        f"💬 /ask /brief /prices /watchlist /addwatch /removewatch /sleeper /rsi /help"
+        f"💬 /ask /scores /memory /brief /prices /watchlist /addwatch /removewatch /sleeper /rsi /help"
     )
 
     morning_sent_today = evening_sent_today = monday_sent_today = friday_sent_today = None
     earnings_check_today = None
     last_price_check = last_rsi_check = last_ma_check = None
     last_news_collect = last_insider_check = last_gift_check = None
-    last_move_check = None
-    last_consider_buying = None
+    last_move_check = last_consider_buying = None
 
     while True:
         now   = datetime.now(EST)
         today = now.date()
         wd    = now.weekday()
 
-        # Monday 7:45am
         if wd == 0 and now.hour == 7 and 45 <= now.minute <= 50 and monday_sent_today != today:
             await send_monday_email(); monday_sent_today = today
 
-        # Daily 9:30am morning email
         if wd < 5 and now.hour == 9 and 30 <= now.minute <= 35 and morning_sent_today != today:
             await send_morning_email(); morning_sent_today = today
 
-        # Daily 5:00pm evening email
         if wd < 5 and now.hour == 17 and 0 <= now.minute <= 5 and evening_sent_today != today:
             await send_evening_email(); evening_sent_today = today
 
-        # Friday 6:00pm
         if wd == 4 and now.hour == 18 and 0 <= now.minute <= 5 and friday_sent_today != today:
             await send_friday_email(); friday_sent_today = today
 
-        # Earnings countdown 8:30am
         if wd < 5 and now.hour == 8 and 30 <= now.minute <= 35 and earnings_check_today != today:
             await check_earnings_countdown(); earnings_check_today = today
 
-        # Market hours checks
         if is_market_open():
             if not last_price_check or (now - last_price_check).seconds >= 300:
                 await check_price_alerts(); last_price_check = now
-
             if not last_rsi_check or (now - last_rsi_check).seconds >= 1800:
                 await check_rsi_alerts(); last_rsi_check = now
-
             if not last_ma_check or (now - last_ma_check).seconds >= 3600:
                 await check_ma_alerts(); last_ma_check = now
-
             if not last_news_collect or (now - last_news_collect).seconds >= 1800:
                 await collect_news(); last_news_collect = now
-
             if not last_insider_check or (now - last_insider_check).seconds >= 14400:
                 await check_insider_trading(); last_insider_check = now
-
             if not last_gift_check or (now - last_gift_check).seconds >= 1800:
                 await check_market_gift(); last_gift_check = now
-
-            # Why did this move — check every 15 minutes
             if not last_move_check or (now - last_move_check).seconds >= 900:
                 await check_why_did_this_move(); last_move_check = now
-
-            # Consider Buying scan — once daily at 10:30am
             if now.hour == 10 and 30 <= now.minute <= 35 and last_consider_buying != today:
                 await run_consider_buying_scan(); last_consider_buying = today
 
